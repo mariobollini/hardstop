@@ -886,10 +886,11 @@ class OverlayController:
         cfg = self._current_cfg
         t   = time.time()
         blink_hz = cfg.get("blink_hz", 0)
-
+        # Snake mode is always fully opaque — blink doesn't apply
+        is_snake = cfg.get("snake_mode", False)
         alpha = (
             0.4 + 0.6 * abs(math.sin(math.pi * blink_hz * t))
-            if blink_hz > 0 else 1.0
+            if blink_hz > 0 and not is_snake else 1.0
         )
         self._border_win.setAlphaValue_(alpha)
 
@@ -1485,6 +1486,28 @@ input[type="range"]::-webkit-slider-thumb{
 #cals-input:focus{border-color:var(--accent)}
 .cals-hint{font-size:11px;color:var(--muted);margin-top:6px}
 
+/* ── Effect segmented control ── */
+.seg-control{display:flex;gap:0;margin-top:4px}
+.seg-btn{
+  flex:1;background:var(--accent-dim);border:1px solid var(--border);
+  color:var(--muted);padding:5px 0;font-size:10px;font-weight:700;
+  letter-spacing:.06em;text-transform:uppercase;cursor:pointer;
+  transition:all .15s;border-radius:0;
+}
+.seg-btn:not(:first-child){border-left:none}
+.seg-btn.active{background:var(--accent);color:#fff;border-color:var(--accent)}
+.seg-btn:hover:not(.active){background:#2a0e0e;color:var(--dim)}
+
+/* ── Width Max button ── */
+.f-width-max{
+  background:none;border:1px solid #441111;color:#663333;
+  padding:3px 7px;font-size:10px;font-weight:700;letter-spacing:.06em;
+  cursor:pointer;flex-shrink:0;transition:all .15s;
+}
+.f-width-max:hover,.f-width-max.active{
+  border-color:var(--accent);color:var(--accent-hi);background:#1a0505;
+}
+
 /* ── Preview button ── */
 .preview-btn{
   width:100%;background:none;border:1px solid #441111;
@@ -1673,8 +1696,9 @@ function buildCard(a, idx, levelNum) {
   <div class="field-row">
     <div class="field-label">Border width</div>
     <div class="slider-row">
-      <input class="f-width" type="range" min="10" max="400" value="${a.width}">
-      <span class="sval f-width-v">${a.width}px</span>
+      <input class="f-width" type="range" min="10" max="400" value="${Math.min(+a.width||40, 400)}">
+      <span class="sval f-width-v">${+a.width >= 1000 ? 'Max' : (+a.width||40)+'px'}</span>
+      <button class="f-width-max octo${+a.width >= 1000 ? ' active' : ''}" title="Fill entire screen">Max</button>
     </div>
   </div>
 
@@ -1688,24 +1712,14 @@ function buildCard(a, idx, levelNum) {
       </div>
     </div>
     <div class="field-row">
-      <div class="toggle-row">
-        <span class="toggle-label field-label">Gradient fade</span>
-        <label class="toggle">
-          <input class="f-gradient" type="checkbox" ${a.gradient ? "checked" : ""}>
-          <div class="ttrack"></div>
-        </label>
-      </div>
-    </div>
-    <div class="field-row">
-      <div class="toggle-row">
-        <span class="toggle-label field-label">Expand (walls close in)</span>
-        <label class="toggle">
-          <input class="f-expand" type="checkbox" ${a.expand ? "checked" : ""}>
-          <div class="ttrack"></div>
-        </label>
+      <div class="field-label">Effect</div>
+      <div class="seg-control">
+        <button class="seg-btn${a.expand ? ' active' : ''}" data-effect="expand">Expand</button>
+        <button class="seg-btn${!a.expand && a.gradient ? ' active' : ''}" data-effect="fade">Fade</button>
+        <button class="seg-btn${!a.expand && !a.gradient ? ' active' : ''}" data-effect="none">None</button>
       </div>
       <div class="f-expand-dep" style="${a.expand ? '' : 'display:none'}">
-        <div class="slider-row" style="margin-top:6px">
+        <div class="slider-row" style="margin-top:8px">
           <input class="f-expand-px" type="range" min="0" max="600" value="${a.expand_px}">
           <span class="sval f-expand-px-v">${a.expand_px}px</span>
         </div>
@@ -1777,11 +1791,18 @@ function wireCard(card, idx) {
     }
   });
 
-  const wSlider = card.querySelector(".f-width");
-  const wVal    = card.querySelector(".f-width-v");
+  const wSlider  = card.querySelector(".f-width");
+  const wVal     = card.querySelector(".f-width-v");
+  const wMaxBtn  = card.querySelector(".f-width-max");
   wSlider.addEventListener("input", e => {
     state.alerts[idx].width = +e.target.value;
     wVal.textContent = `${state.alerts[idx].width}px`;
+    wMaxBtn.classList.remove("active");
+  });
+  wMaxBtn.addEventListener("click", () => {
+    const isMax = wMaxBtn.classList.toggle("active");
+    state.alerts[idx].width = isMax ? 2000 : +wSlider.value;
+    wVal.textContent = isMax ? "Max" : `${+wSlider.value}px`;
   });
 
   const bSlider = card.querySelector(".f-blink");
@@ -1791,15 +1812,17 @@ function wireCard(card, idx) {
     bVal.textContent = `${state.alerts[idx].blink_hz.toFixed(1)} Hz`;
   });
 
-  card.querySelector(".f-gradient").addEventListener("change", e => {
-    state.alerts[idx].gradient = e.target.checked;
-  });
-
-  const expandCb  = card.querySelector(".f-expand");
+  // Effect segmented control: Expand / Fade / None
   const expandDep = card.querySelector(".f-expand-dep");
-  expandCb.addEventListener("change", e => {
-    state.alerts[idx].expand = e.target.checked;
-    expandDep.style.display = e.target.checked ? "" : "none";
+  card.querySelectorAll(".seg-btn").forEach(btn => {
+    btn.addEventListener("click", () => {
+      card.querySelectorAll(".seg-btn").forEach(b => b.classList.remove("active"));
+      btn.classList.add("active");
+      const effect = btn.dataset.effect;
+      state.alerts[idx].expand   = effect === "expand";
+      state.alerts[idx].gradient = effect === "fade";
+      expandDep.style.display = effect === "expand" ? "" : "none";
+    });
   });
   const ePxSlider = card.querySelector(".f-expand-px");
   const ePxVal    = card.querySelector(".f-expand-px-v");
