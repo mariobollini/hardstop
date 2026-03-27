@@ -317,23 +317,36 @@ def parse_hardstop_input(text: str) -> datetime | None:
 
     Accepted formats:
       "4:55pm", "4:55 PM", "16:55"  — time of day (today or tomorrow if past)
-      "30m"                          — 30 minutes from now
-      "1h", "1h30m", "90m"          — duration from now
+      "30m", "30min", "30 min"       — 30 minutes from now
+      "1h", "1h30m", "1 hour 30 min" — duration from now
+      "45"                            — bare integer = minutes from now
     """
-    text = text.strip().lower().replace(" ", "")
+    text = text.strip().lower()
+    # Normalise unit aliases before collapsing spaces
+    text = re.sub(r"\bhours?\b", "h", text)
+    text = re.sub(r"\bmin(?:utes?)?\b", "m", text)
+    text = re.sub(r"\s+", "", text)   # drop all remaining spaces
     now = datetime.now().astimezone()
 
-    # Duration with hours+minutes: "1h30m", "1h", "30m", "90m"
-    m = re.fullmatch(r"(?:(\d+)h)?(\d+)m?", text)
-    if m and (m.group(1) or m.group(2)):
+    # Hours + minutes: "1h30m", "30m", "90m"
+    m = re.fullmatch(r"(?:(\d+)h)?(\d+)m", text)
+    if m:
         hours = int(m.group(1) or 0)
-        mins = int(m.group(2) or 0)
+        mins  = int(m.group(2) or 0)
         if hours or mins:
             return now + timedelta(hours=hours, minutes=mins)
 
+    # Hours only: "2h"
     m = re.fullmatch(r"(\d+)h", text)
     if m:
         return now + timedelta(hours=int(m.group(1)))
+
+    # Bare integer → minutes
+    m = re.fullmatch(r"(\d+)", text)
+    if m:
+        mins = int(m.group(1))
+        if mins > 0:
+            return now + timedelta(minutes=mins)
 
     # Time of day
     for fmt in ("%I:%M%p", "%H:%M", "%I%p"):
@@ -1113,7 +1126,27 @@ class _AppDelegate(NSObject):
 
         if alert.runModal() == 1000:  # NSAlertFirstButtonReturn
             name = name_field.stringValue().strip() or "Hardstop"
-            dt = parse_hardstop_input(time_field.stringValue())
+            time_text = time_field.stringValue().strip().lower()
+
+            # Test shortcuts: "test1" / "test2" / "test3" → fire that alert level now
+            m_test = re.match(r"^test(\d+)$", time_text)
+            if m_test:
+                level_idx = int(m_test.group(1)) - 1
+                alerts_desc = sorted(
+                    self._config.get("alerts", []),
+                    key=lambda a: a["minutes_before"],
+                    reverse=True,
+                )
+                if 0 <= level_idx < len(alerts_desc):
+                    cfg = alerts_desc[level_idx]
+                    start_dt = datetime.now(tz=timezone.utc)
+                    label = name if name != "Hardstop" else f"Test Level {level_idx + 1}"
+                    self._on_alert_from_thread(
+                        f"__test_{level_idx}__", label, start_dt, cfg, alerts_desc,
+                    )
+                return
+
+            dt = parse_hardstop_input(time_text)
             if dt:
                 save_hardstop(dt, name)
                 print(f"Hardstop '{name}' set for {dt.astimezone().strftime('%-I:%M %p')}")
@@ -1121,7 +1154,7 @@ class _AppDelegate(NSObject):
                 self._scheduler.reset_hardstop_alerts()
             else:
                 err = NSAlert.new()
-                err.setMessageText_("Couldn't parse the time. Try '4:55pm' or '30m'.")
+                err.setMessageText_("Couldn't parse the time. Try '4:55pm', '30m', '1h30min'.")
                 err.runModal()
 
     def clearHardstop_(self, _sender) -> None:
@@ -1201,6 +1234,17 @@ def _run_config_server() -> None:
     def ping():
         return jsonify({"ok": True})
 
+    @app.get("/api/auth_status")
+    def auth_status():
+        with _calendar_lock:
+            authorized = _calendar_service is not None
+        return jsonify({"authorized": authorized})
+
+    @app.post("/api/authorize")
+    def do_authorize():
+        threading.Thread(target=authorize_calendar, daemon=True).start()
+        return jsonify({"ok": True})
+
     serve(app, host="127.0.0.1", port=_CONFIG_PORT, _quiet=True)
 
 
@@ -1216,7 +1260,6 @@ _CONFIG_HTML = r"""<!DOCTYPE html>
 :root{
   --bg:#0c0c0c;
   --card:#131010;
-  --card2:#1a1414;
   --border:#2a1515;
   --accent:#cc2200;
   --accent-hi:#ff4422;
@@ -1228,7 +1271,6 @@ _CONFIG_HTML = r"""<!DOCTYPE html>
   --cut:6px;
 }
 
-/* ── Octagon clip-path helper ── */
 .octo{
   clip-path:polygon(
     var(--cut) 0,calc(100% - var(--cut)) 0,
@@ -1259,30 +1301,7 @@ header h1 span{color:var(--accent-hi)}
 #save-btn:active{background:#991800}
 
 /* ── Main ── */
-main{max-width:920px;margin:0 auto;padding:20px 16px 60px}
-
-/* ── Calendars (collapsible) ── */
-.cals-wrap{
-  background:var(--card);border:1px solid var(--border);
-  margin-bottom:18px;overflow:hidden;
-}
-.cals-wrap summary{
-  list-style:none;padding:10px 14px;cursor:pointer;
-  font-size:11px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;
-  color:var(--muted);user-select:none;display:flex;align-items:center;gap:8px;
-}
-.cals-wrap summary::before{content:"▸";font-size:10px;color:var(--accent);transition:transform .2s}
-.cals-wrap[open] summary::before{transform:rotate(90deg)}
-.cals-wrap summary::-webkit-details-marker{display:none}
-.cals-inner{padding:0 14px 14px}
-#cals-input{
-  width:100%;background:#090404;border:1px solid var(--border);
-  color:var(--text);padding:7px 10px;font-size:12px;
-  font-family:"SF Mono",Menlo,monospace;
-  outline:none;resize:vertical;min-height:44px;
-}
-#cals-input:focus{border-color:var(--accent)}
-.cals-hint{font-size:11px;color:var(--muted);margin-top:6px}
+main{max-width:960px;margin:0 auto;padding:20px 16px 60px}
 
 /* ── Section label ── */
 .section-label{
@@ -1290,13 +1309,35 @@ main{max-width:920px;margin:0 auto;padding:20px 16px 60px}
   color:var(--muted);margin-bottom:10px;
 }
 
-/* ── Alerts grid: 3 columns ── */
-.alerts-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:12px}
+/* ── Alerts grid: flex, carousel when >3 ── */
+.alerts-grid{
+  display:flex;flex-wrap:nowrap;gap:10px;
+  overflow-x:auto;align-items:stretch;
+  padding-bottom:4px;margin-bottom:18px;
+  scrollbar-width:thin;scrollbar-color:var(--accent-dim) transparent;
+}
+.alerts-grid::-webkit-scrollbar{height:4px}
+.alerts-grid::-webkit-scrollbar-track{background:transparent}
+.alerts-grid::-webkit-scrollbar-thumb{background:var(--accent-dim);border-radius:0}
 
-/* ── Alert card ── */
-.alert-card{background:var(--card);border:1px solid var(--border);overflow:hidden}
+/* <=3: cards expand equally */
+.alert-card{flex:1 1 0;min-width:200px;background:var(--card);border:1px solid var(--border);overflow:hidden}
+/* >3 (carousel): fixed width so they overflow */
+.alerts-grid.carousel .alert-card{flex:0 0 270px}
+
 .alert-card:hover{border-color:#3d2020}
 
+/* ── + card ── */
+.add-card{
+  flex:0 0 48px;background:none;border:1px dashed #441111;
+  color:#663333;cursor:pointer;
+  display:flex;align-items:center;justify-content:center;
+  font-size:26px;font-weight:200;min-height:160px;
+  transition:all .15s;
+}
+.add-card:hover{border-color:var(--accent);color:var(--accent-hi);background:#110505}
+
+/* ── Card header ── */
 .card-header{
   display:flex;align-items:center;gap:8px;padding:9px 10px;
   background:#161010;border-bottom:1px solid var(--border);
@@ -1315,7 +1356,7 @@ main{max-width:920px;margin:0 auto;padding:20px 16px 60px}
 }
 .remove-btn:hover{background:#2a0808;border-color:var(--accent);color:var(--accent-hi)}
 
-/* ── Preview canvas ── */
+/* ── Preview ── */
 .preview-wrap{padding:8px 8px 0;background:#090505}
 .preview-canvas{display:block;width:100%;background:#060303}
 
@@ -1324,8 +1365,7 @@ main{max-width:920px;margin:0 auto;padding:20px 16px 60px}
 .mode-tab{
   flex:1;background:var(--accent-dim);border:1px solid var(--border);
   color:var(--muted);padding:5px 0;font-size:11px;font-weight:700;
-  letter-spacing:.05em;cursor:pointer;text-align:center;
-  transition:all .15s;border-radius:0;
+  letter-spacing:.05em;cursor:pointer;text-align:center;transition:all .15s;border-radius:0;
 }
 .mode-tab:first-child{border-right:none}
 .mode-tab.active{background:var(--accent);color:#fff;border-color:var(--accent)}
@@ -1333,7 +1373,6 @@ main{max-width:920px;margin:0 auto;padding:20px 16px 60px}
 
 /* ── Card fields ── */
 .card-fields{padding:10px 10px 12px;display:flex;flex-direction:column;gap:10px}
-
 .field-row{display:flex;flex-direction:column;gap:4px}
 .field-label{font-size:10px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;color:var(--muted)}
 
@@ -1383,13 +1422,42 @@ input[type="range"]::-webkit-slider-thumb{
 }
 .toggle input:checked + .ttrack::after{left:calc(100% - 14px);background:var(--accent-hi)}
 
-/* ── Add button ── */
-#add-btn{
-  display:block;width:100%;background:none;border:1px dashed #441111;
-  color:#884444;padding:11px;font-size:12px;font-weight:700;
-  cursor:pointer;letter-spacing:.05em;transition:all .15s;border-radius:0;
+/* ── Calendar settings ── */
+.cals-wrap{
+  background:var(--card);border:1px solid var(--border);
+  margin-bottom:18px;overflow:hidden;
 }
-#add-btn:hover{border-color:var(--accent);color:var(--accent-hi);background:#110505}
+.cals-wrap summary{
+  list-style:none;padding:10px 14px;cursor:pointer;
+  font-size:11px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;
+  color:var(--muted);user-select:none;display:flex;align-items:center;gap:8px;
+}
+.cals-wrap summary::before{content:"▸";font-size:10px;color:var(--accent);transition:transform .2s}
+.cals-wrap[open] summary::before{transform:rotate(90deg)}
+.cals-wrap summary::-webkit-details-marker{display:none}
+.cals-inner{padding:0 14px 14px}
+
+.cal-auth-row{
+  display:flex;align-items:center;gap:10px;
+  padding:10px 0 12px;border-bottom:1px solid var(--border);margin-bottom:14px;
+}
+.cal-auth-status{flex:1;font-size:12px;color:var(--muted)}
+.cal-auth-status.ok{color:var(--success)}
+.cal-auth-btn{
+  background:var(--accent-dim);color:var(--dim);border:1px solid var(--border);
+  padding:5px 12px;font-size:11px;font-weight:700;cursor:pointer;
+  letter-spacing:.05em;transition:all .15s;
+}
+.cal-auth-btn:hover{background:var(--accent);color:#fff;border-color:var(--accent)}
+
+#cals-input{
+  width:100%;background:#090404;border:1px solid var(--border);
+  color:var(--text);padding:7px 10px;font-size:12px;
+  font-family:"SF Mono",Menlo,monospace;
+  outline:none;resize:vertical;min-height:44px;
+}
+#cals-input:focus{border-color:var(--accent)}
+.cals-hint{font-size:11px;color:var(--muted);margin-top:6px}
 
 /* ── Toast ── */
 #toast{
@@ -1407,39 +1475,38 @@ input[type="range"]::-webkit-slider-thumb{
 <body>
 
 <header>
-  <!-- Stop sign SVG -->
-  <svg class="logo-svg octo" width="30" height="30" viewBox="0 0 30 30">
+  <!-- Plain red octagon — no text, matches menu bar icon -->
+  <svg class="logo-svg" width="26" height="26" viewBox="0 0 30 30">
     <polygon points="9,2 21,2 28,9 28,21 21,28 9,28 2,21 2,9"
-             fill="#cc2200" stroke="#ff4422" stroke-width="0.8"/>
-    <text x="15" y="19" text-anchor="middle" fill="white"
-          font-size="7" font-weight="900" letter-spacing="0.3"
-          font-family="-apple-system,sans-serif">STOP</text>
+             fill="#cc2200" stroke="#ff4422" stroke-width="1"/>
   </svg>
   <h1><span>Hardstop</span> Config</h1>
   <button id="save-btn" class="octo">Save</button>
 </header>
 
 <main>
+  <div class="section-label">Alert Levels — most to least urgent, left to right</div>
+  <div id="alerts-grid" class="alerts-grid"></div>
+
   <details class="cals-wrap octo">
-    <summary>Calendar Settings</summary>
+    <summary>Google Calendar Settings</summary>
     <div class="cals-inner">
+      <div class="cal-auth-row">
+        <span class="cal-auth-status" id="cal-auth-status">Checking…</span>
+        <button class="cal-auth-btn octo" id="cal-auth-btn">Authorize</button>
+      </div>
+      <div class="field-label" style="margin-bottom:6px">Calendar IDs</div>
       <textarea id="cals-input" rows="2"
         placeholder="Leave empty for primary calendar. One calendar ID per line."></textarea>
       <div class="cals-hint">Find your calendar ID in Google Calendar → Settings → Integrate calendar</div>
     </div>
   </details>
-
-  <div class="section-label">Alert Levels — sorted most to least urgent</div>
-  <div id="alerts-grid" class="alerts-grid"></div>
-  <button id="add-btn" class="octo">+ Add Alert Level</button>
 </main>
 
 <div id="toast"></div>
 
 <script>
-// ── Constants ────────────────────────────────────────────────────────────────
-
-// Reference screen size for realistic border-width preview scaling
+// ── Constants ─────────────────────────────────────────────────────────────────
 const REF_W = 1920, REF_H = 1080;
 
 const DEFAULT_ALERT = {
@@ -1449,13 +1516,11 @@ const DEFAULT_ALERT = {
   snake_mode: false, snake_speed: 80, snake_start: 0.0,
 };
 
-// ── State ────────────────────────────────────────────────────────────────────
-
+// ── State ─────────────────────────────────────────────────────────────────────
 let state = { calendars: [], alerts: [] };
-let rafs = {}; // idx -> requestAnimationFrame handle
+let rafs = {};
 
-// ── Boot ─────────────────────────────────────────────────────────────────────
-
+// ── Boot ──────────────────────────────────────────────────────────────────────
 async function boot() {
   try {
     const r = await fetch("/api/config");
@@ -1465,10 +1530,37 @@ async function boot() {
     document.getElementById("cals-input").value = state.calendars.join("\n");
     renderAlerts();
   } catch(e) { toast("Failed to load config: " + e, true); }
+  checkAuthStatus();
 }
 
-// ── Render ───────────────────────────────────────────────────────────────────
+// ── Calendar auth ─────────────────────────────────────────────────────────────
+async function checkAuthStatus() {
+  try {
+    const r = await fetch("/api/auth_status");
+    const d = await r.json();
+    const el  = document.getElementById("cal-auth-status");
+    const btn = document.getElementById("cal-auth-btn");
+    if (d.authorized) {
+      el.textContent = "✓ Google Calendar authorized";
+      el.className = "cal-auth-status ok";
+      btn.textContent = "Re-authorize";
+    } else {
+      el.textContent = "Not authorized — calendar polling disabled";
+      el.className = "cal-auth-status";
+      btn.textContent = "Authorize Google Calendar";
+    }
+  } catch(e) {}
+}
 
+document.getElementById("cal-auth-btn").addEventListener("click", async () => {
+  try {
+    await fetch("/api/authorize", { method: "POST" });
+    toast("Browser will open for Google Calendar authorization");
+    setTimeout(checkAuthStatus, 8000);
+  } catch(e) { toast("Authorization failed: " + e, true); }
+});
+
+// ── Render ────────────────────────────────────────────────────────────────────
 function renderAlerts() {
   Object.values(rafs).forEach(cancelAnimationFrame);
   rafs = {};
@@ -1476,7 +1568,10 @@ function renderAlerts() {
   const grid = document.getElementById("alerts-grid");
   grid.innerHTML = "";
 
-  // Sort descending by minutes_before (most urgent = "Now" on left, 5min on right)
+  const count = state.alerts.length;
+  grid.classList.toggle("carousel", count > 3);
+
+  // Sort descending by minutes_before: most minutes = LVL 1 (least urgent first)
   const order = [...state.alerts]
     .map((a, i) => ({ ...a, _i: i }))
     .sort((a, b) => b.minutes_before - a.minutes_before);
@@ -1486,11 +1581,23 @@ function renderAlerts() {
     grid.appendChild(card);
     initPreview(card.querySelector(".preview-canvas"), a._i);
   });
+
+  // + card at the end
+  const addCard = document.createElement("button");
+  addCard.className = "add-card";
+  addCard.title = "Add alert level";
+  addCard.textContent = "+";
+  addCard.addEventListener("click", () => {
+    state.alerts.push({ ...DEFAULT_ALERT, minutes_before: 10 });
+    renderAlerts();
+    grid.scrollTo({ left: grid.scrollWidth, behavior: "smooth" });
+  });
+  grid.appendChild(addCard);
 }
 
 function buildCard(a, idx, levelNum) {
   const card = document.createElement("div");
-  card.className = "alert-card octo";
+  card.className = "alert-card";
   card.dataset.idx = idx;
 
   const minsLabel = a.minutes_before === 0 ? "At meeting start"
@@ -1595,15 +1702,12 @@ function buildCard(a, idx, levelNum) {
 }
 
 function wireCard(card, idx) {
-  const a = () => state.alerts[idx];
-
   card.querySelector(".remove-btn").addEventListener("click", () => {
     if (state.alerts.length <= 1) return;
     state.alerts.splice(idx, 1);
     renderAlerts();
   });
 
-  // Mode tabs
   card.querySelectorAll(".mode-tab").forEach(tab => {
     tab.addEventListener("click", () => {
       const isSnake = tab.dataset.mode === "snake";
@@ -1614,7 +1718,6 @@ function wireCard(card, idx) {
     });
   });
 
-  // Minutes
   const minsInput = card.querySelector(".f-mins");
   minsInput.addEventListener("input", e => {
     const v = parseInt(e.target.value) || 0;
@@ -1623,7 +1726,6 @@ function wireCard(card, idx) {
     card.querySelector(".f-mins-label").textContent = label;
   });
 
-  // Color
   const colorPicker = card.querySelector(".f-color");
   const colorHex    = card.querySelector(".f-hex");
   colorPicker.addEventListener("input", e => {
@@ -1637,7 +1739,6 @@ function wireCard(card, idx) {
     }
   });
 
-  // Width
   const wSlider = card.querySelector(".f-width");
   const wVal    = card.querySelector(".f-width-v");
   wSlider.addEventListener("input", e => {
@@ -1645,7 +1746,6 @@ function wireCard(card, idx) {
     wVal.textContent = `${state.alerts[idx].width}px`;
   });
 
-  // Blink
   const bSlider = card.querySelector(".f-blink");
   const bVal    = card.querySelector(".f-blink-v");
   bSlider.addEventListener("input", e => {
@@ -1653,12 +1753,10 @@ function wireCard(card, idx) {
     bVal.textContent = `${state.alerts[idx].blink_hz.toFixed(1)} Hz`;
   });
 
-  // Gradient
   card.querySelector(".f-gradient").addEventListener("change", e => {
     state.alerts[idx].gradient = e.target.checked;
   });
 
-  // Expand
   const expandCb  = card.querySelector(".f-expand");
   const expandDep = card.querySelector(".f-expand-dep");
   expandCb.addEventListener("change", e => {
@@ -1672,7 +1770,6 @@ function wireCard(card, idx) {
     ePxVal.textContent = `${state.alerts[idx].expand_px}px`;
   });
 
-  // Snake speed
   const ssSlider = card.querySelector(".f-snake-speed");
   const ssVal    = card.querySelector(".f-snake-speed-v");
   ssSlider.addEventListener("input", e => {
@@ -1680,26 +1777,21 @@ function wireCard(card, idx) {
     ssVal.textContent = `${state.alerts[idx].snake_speed} px/s`;
   });
 
-  // Snake start
   const stSlider = card.querySelector(".f-snake-start");
   const stVal    = card.querySelector(".f-snake-start-v");
   stSlider.addEventListener("input", e => {
     state.alerts[idx].snake_start = +e.target.value;
     stVal.textContent = `${Math.round(state.alerts[idx].snake_start * 100)}%`;
-    // Reset the preview start time so snake restarts from configured coverage
     const canvas = card.querySelector(".preview-canvas");
     if (canvas) canvas._startTime = performance.now() / 1000;
   });
 }
 
-// ── Preview ──────────────────────────────────────────────────────────────────
-
+// ── Preview ───────────────────────────────────────────────────────────────────
 function initPreview(canvas, idx) {
   if (!canvas) return;
-  // Match canvas pixel size to CSS display size
-  const cw = canvas.parentElement.clientWidth - 16; // subtract padding
+  const cw = canvas.parentElement.clientWidth - 16;
   canvas.width  = Math.max(60, cw);
-  // Height proportional to REF screen aspect
   canvas.height = Math.round(canvas.width * REF_H / REF_W);
   canvas._startTime = performance.now() / 1000;
 
@@ -1719,23 +1811,16 @@ function drawPreview(canvas, a, t) {
   if (!a) return;
   const ctx = canvas.getContext("2d");
   const W = canvas.width, H = canvas.height;
-
-  // Scale border width from reference 1920px screen to canvas width
   const scale = W / REF_W;
   const w = Math.max(1, Math.round((+a.width || 40) * scale));
-
   ctx.clearRect(0, 0, W, H);
   ctx.fillStyle = "#060303";
   ctx.fillRect(0, 0, W, H);
-
   const [r, g, b] = hexToRgb(a.color);
-
-  // Blink is only applied in perimeter mode (snake doesn't blink)
   let alpha = 1.0;
   if (!a.snake_mode && (+a.blink_hz || 0) > 0) {
     alpha = 0.4 + 0.6 * Math.abs(Math.sin(Math.PI * a.blink_hz * t));
   }
-
   if (a.snake_mode) {
     drawSnake(ctx, W, H, w, r, g, b, a, t, canvas._startTime || t);
   } else {
@@ -1746,15 +1831,12 @@ function drawPreview(canvas, a, t) {
 function drawBorder(ctx, W, H, w, r, g, b, alpha, gradient) {
   const color = `rgba(${r},${g},${b},${alpha})`;
   const clear  = `rgba(${r},${g},${b},0)`;
-
-  // [x, y, sw, sh, grad: [x0,y0] -> [x1,y1] means clear->color]
   const strips = [
-    [0,     H-w, W,  w,   0, H-w,   0, H],   // top
-    [0,     0,   W,  w,   0, w,     0, 0],    // bottom
-    [0,     0,   w,  H,   w, 0,     0, 0],    // left
-    [W-w,   0,   w,  H,   W-w, 0,   W, 0],   // right
+    [0,   H-w, W, w,  0, H-w, 0, H],
+    [0,   0,   W, w,  0, w,   0, 0],
+    [0,   0,   w, H,  w, 0,   0, 0],
+    [W-w, 0,   w, H,  W-w,0, W, 0],
   ];
-
   for (const [x,y,sw,sh,x0,y0,x1,y1] of strips) {
     if (gradient) {
       const g2 = ctx.createLinearGradient(x0, y0, x1, y1);
@@ -1770,33 +1852,26 @@ function drawBorder(ctx, W, H, w, r, g, b, alpha, gradient) {
 
 function drawSnake(ctx, W, H, w, r, g, b, a, t, startTime) {
   const hw = w / 2;
-
-  // Clockwise segments: top, right, bottom, left (center-line of border)
   const segs = [
-    [hw,    H-hw, W-hw, H-hw],
-    [W-hw,  H-hw, W-hw, hw],
-    [W-hw,  hw,   hw,   hw],
-    [hw,    hw,   hw,   H-hw],
+    [hw,   H-hw, W-hw, H-hw],
+    [W-hw, H-hw, W-hw, hw],
+    [W-hw, hw,   hw,   hw],
+    [hw,   hw,   hw,   H-hw],
   ];
   const segLens = segs.map(([sx,sy,ex,ey]) => Math.hypot(ex-sx, ey-sy));
   const canvasPerimeter = segLens.reduce((a,b) => a+b, 0);
-
-  // Compute coverage using real-screen perimeter for accurate speed simulation
-  const realPerimeter = 2 * (REF_W - (+a.width||40)) + 2 * (REF_H - (+a.width||40));
+  const realPerimeter = 2*(REF_W-(+a.width||40)) + 2*(REF_H-(+a.width||40));
   const startFrac = +(a.snake_start) || 0;
   const speed     = +(a.snake_speed) || 80;
   const elapsed   = Math.max(0, t - startTime);
   const coverage  = Math.min(1.0, startFrac + elapsed * (speed / realPerimeter));
-
   const targetLen = coverage * canvasPerimeter;
   if (targetLen <= 0) return;
-
   ctx.strokeStyle = `rgb(${r},${g},${b})`;
   ctx.lineWidth   = w;
   ctx.lineCap     = "butt";
   ctx.lineJoin    = "miter";
   ctx.beginPath();
-
   let rem = targetLen, first = true;
   for (let i = 0; i < segs.length && rem > 0; i++) {
     const [sx,sy,ex,ey] = segs[i];
@@ -1813,8 +1888,7 @@ function drawSnake(ctx, W, H, w, r, g, b, a, t, startTime) {
   ctx.stroke();
 }
 
-// ── Save ─────────────────────────────────────────────────────────────────────
-
+// ── Save ──────────────────────────────────────────────────────────────────────
 document.getElementById("save-btn").addEventListener("click", async () => {
   const raw = document.getElementById("cals-input").value.trim();
   state.calendars = raw ? raw.split("\n").map(s => s.trim()).filter(Boolean) : [];
@@ -1829,13 +1903,7 @@ document.getElementById("save-btn").addEventListener("click", async () => {
   } catch(e) { toast("Save failed: " + e, true); }
 });
 
-document.getElementById("add-btn").addEventListener("click", () => {
-  state.alerts.push({ ...DEFAULT_ALERT, minutes_before: 10 });
-  renderAlerts();
-});
-
 // ── Toast ─────────────────────────────────────────────────────────────────────
-
 let _tt = null;
 function toast(msg, err = false) {
   const el = document.getElementById("toast");
@@ -1849,6 +1917,8 @@ boot();
 </script>
 </body>
 </html>"""
+
+
 
 # ── Entry point ──────────────────────────────────────────────────────────────
 
