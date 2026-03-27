@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hardstop"
+version = "0.1.0"
+description = "Google Calendar & deadline overlay for ultrawide monitors"
+requires-python = ">=3.11"
+dependencies = [
+    "pyobjc-framework-Cocoa>=10.0",
+    "google-api-python-client>=2.0",
+    "google-auth-oauthlib>=1.0",
+    "google-auth-httplib2>=0.2",
+    "PyYAML>=6.0",
+]
+
+[project.scripts]
+hardstop = "hardstop:main"
+
+[tool.setuptools]
+py-modules = ["hardstop"]
