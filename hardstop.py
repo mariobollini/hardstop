@@ -914,12 +914,17 @@ class OverlayController:
 
 # ── App delegate ─────────────────────────────────────────────────────────────
 
+_app_delegate = None  # set at launch so Flask routes can dispatch alerts
+
+
 class _AppDelegate(NSObject):
 
     def applicationDidFinishLaunching_(self, _notif):
+        global _app_delegate
         from AppKit import NSStatusBar, NSVariableStatusItemLength
         from Foundation import NSTimer
 
+        _app_delegate = self
         self._config  = load_config()
         self._overlay = OverlayController()
         self._upcoming: list[tuple[str, datetime]] = []
@@ -1245,6 +1250,27 @@ def _run_config_server() -> None:
         threading.Thread(target=authorize_calendar, daemon=True).start()
         return jsonify({"ok": True})
 
+    @app.get("/api/preview/<int:n>")
+    def preview_alert(n):
+        if _app_delegate is None:
+            return jsonify({"ok": False, "error": "App not ready"}), 503
+        cfg = load_config()
+        alerts_desc = sorted(
+            cfg.get("alerts", []),
+            key=lambda a: a["minutes_before"],
+            reverse=True,
+        )
+        level_idx = n - 1
+        if not (0 <= level_idx < len(alerts_desc)):
+            return jsonify({"ok": False, "error": "Level out of range"}), 400
+        alert_cfg = alerts_desc[level_idx]
+        start_dt = datetime.now(tz=timezone.utc)
+        _app_delegate._on_alert_from_thread(
+            f"__preview_{level_idx}__", f"Preview Level {n}",
+            start_dt, alert_cfg, alerts_desc,
+        )
+        return jsonify({"ok": True})
+
     serve(app, host="127.0.0.1", port=_CONFIG_PORT, _quiet=True)
 
 
@@ -1458,6 +1484,16 @@ input[type="range"]::-webkit-slider-thumb{
 }
 #cals-input:focus{border-color:var(--accent)}
 .cals-hint{font-size:11px;color:var(--muted);margin-top:6px}
+
+/* ── Preview button ── */
+.preview-btn{
+  width:100%;background:none;border:1px solid #441111;
+  color:#884444;padding:7px 0;font-size:11px;font-weight:700;
+  letter-spacing:.06em;text-transform:uppercase;cursor:pointer;
+  transition:all .15s;margin-top:4px;
+}
+.preview-btn:hover{border-color:var(--accent);color:var(--accent-hi);background:#110505}
+.preview-btn:active{background:#1a0505}
 
 /* ── Toast ── */
 #toast{
@@ -1695,6 +1731,8 @@ function buildCard(a, idx, levelNum) {
     </div>
   </div>
 
+  <button class="preview-btn octo" data-level="${levelNum}">▶ Preview</button>
+
 </div>`;
 
   wireCard(card, idx);
@@ -1784,6 +1822,15 @@ function wireCard(card, idx) {
     stVal.textContent = `${Math.round(state.alerts[idx].snake_start * 100)}%`;
     const canvas = card.querySelector(".preview-canvas");
     if (canvas) canvas._startTime = performance.now() / 1000;
+  });
+
+  card.querySelector(".preview-btn").addEventListener("click", async () => {
+    const n = +card.querySelector(".preview-btn").dataset.level;
+    try {
+      const r = await fetch(`/api/preview/${n}`);
+      const d = await r.json();
+      d.ok ? toast(`▶ Level ${n} preview fired`) : toast(d.error || "Preview failed", true);
+    } catch(e) { toast("Preview failed: " + e, true); }
   });
 }
 
