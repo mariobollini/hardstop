@@ -13,6 +13,8 @@ dependencies = [
     "google-auth-oauthlib>=1.0",
     "google-auth-httplib2>=0.2",
     "PyYAML>=6.0",
+    "Flask>=3.0",
+    "waitress>=3.0",
 ]
 
 [project.scripts]

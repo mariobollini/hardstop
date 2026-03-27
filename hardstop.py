@@ -1131,8 +1131,15 @@ class _AppDelegate(NSObject):
 
     def editConfig_(self, _sender) -> None:
         if not CONFIG_PATH.exists():
-            load_config()  # creates default
-        subprocess.run(["open", str(CONFIG_PATH)], check=False)
+            load_config()
+        url = f"http://localhost:{_CONFIG_PORT}/config"
+        if _port_in_use(_CONFIG_PORT):
+            subprocess.run(["open", url], check=False)
+            return
+        if not getattr(self, "_config_server_started", False):
+            _start_config_server()
+            self._config_server_started = True
+        threading.Timer(0.5, lambda: subprocess.run(["open", url], check=False)).start()
 
     def authorizeCalendar_(self, _sender) -> None:
         threading.Thread(target=authorize_calendar, daemon=True).start()
@@ -1142,6 +1149,910 @@ class _AppDelegate(NSObject):
         _set_login_item(enabled)
         sender.setState_(1 if enabled else 0)
 
+
+# ── Config web server ────────────────────────────────────────────────────────
+
+_CONFIG_PORT = 7891
+
+
+def _port_in_use(port: int) -> bool:
+    import socket
+    with socket.socket() as s:
+        return s.connect_ex(("127.0.0.1", port)) == 0
+
+
+def _start_config_server() -> None:
+    """Launch the Flask config server on a background daemon thread."""
+    import threading
+    t = threading.Thread(target=_run_config_server, daemon=True)
+    t.start()
+
+
+def _run_config_server() -> None:
+    from flask import Flask, jsonify, request, Response
+    from waitress import serve
+
+    app = Flask(__name__)
+
+    @app.get("/config")
+    def serve_config_page():
+        return Response(_CONFIG_HTML, mimetype="text/html",
+                        headers={"Cache-Control": "no-store"})
+
+    @app.get("/api/config")
+    def get_config():
+        cfg = load_config()
+        return jsonify(cfg)
+
+    @app.post("/api/config")
+    def post_config():
+        import yaml
+        data = request.get_json(force=True)
+        try:
+            APP_DIR.mkdir(parents=True, exist_ok=True)
+            CONFIG_PATH.write_text(
+                yaml.dump(data, default_flow_style=False, sort_keys=False)
+            )
+            return jsonify({"ok": True})
+        except Exception as e:
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.get("/api/ping")
+    def ping():
+        return jsonify({"ok": True})
+
+    serve(app, host="127.0.0.1", port=_CONFIG_PORT, _quiet=True)
+
+
+_CONFIG_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hardstop Config</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg:           #0c0c0c;
+  --card:         #141414;
+  --card-hover:   #1a1212;
+  --border:       #2a1a1a;
+  --border-focus: #662222;
+  --accent:       #cc2200;
+  --accent-light: #ff4422;
+  --accent-dim:   #441100;
+  --text:         #ddd0d0;
+  --text-muted:   #776666;
+  --text-dim:     #998888;
+  --success:      #44cc66;
+  --toggle-off:   #332222;
+  --toggle-on:    #882200;
+  --radius:       10px;
+  --radius-sm:    6px;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-size: 13px;
+  min-height: 100vh;
+}
+
+/* ── Header ── */
+header {
+  position: sticky;
+  top: 0;
+  z-index: 100;
+  background: #0e0808;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 14px 24px;
+}
+
+.logo {
+  font-size: 22px;
+  line-height: 1;
+}
+
+header h1 {
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text);
+  flex: 1;
+}
+
+header h1 span { color: var(--accent-light); }
+
+#save-btn {
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  border-radius: var(--radius-sm);
+  padding: 7px 20px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  letter-spacing: 0.04em;
+  transition: background 0.15s;
+}
+#save-btn:hover  { background: var(--accent-light); }
+#save-btn:active { background: #991a00; }
+
+/* ── Main layout ── */
+main {
+  max-width: 760px;
+  margin: 0 auto;
+  padding: 28px 24px 80px;
+}
+
+/* ── Alert cards ── */
+.alert-card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  margin-bottom: 16px;
+  overflow: hidden;
+  transition: border-color 0.15s;
+}
+.alert-card:hover { border-color: #3a2020; }
+
+.card-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 16px;
+  cursor: pointer;
+  user-select: none;
+  background: #161010;
+  border-bottom: 1px solid var(--border);
+}
+
+.level-badge {
+  background: var(--accent-dim);
+  color: var(--accent-light);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  padding: 2px 8px;
+  border-radius: 4px;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.level-title {
+  flex: 1;
+  font-size: 13px;
+  color: var(--text-dim);
+}
+
+.collapse-arrow {
+  color: var(--text-muted);
+  font-size: 11px;
+  transition: transform 0.2s;
+}
+.alert-card.collapsed .collapse-arrow { transform: rotate(-90deg); }
+
+.remove-btn {
+  background: none;
+  border: 1px solid #441111;
+  color: #884444;
+  border-radius: 4px;
+  width: 24px;
+  height: 24px;
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.15s;
+}
+.remove-btn:hover { background: #330a0a; border-color: var(--accent); color: var(--accent-light); }
+
+.card-body {
+  padding: 20px 20px 16px;
+  display: grid;
+  grid-template-columns: 1fr 220px;
+  gap: 20px 24px;
+}
+.alert-card.collapsed .card-body { display: none; }
+
+/* ── Preview canvas ── */
+.preview-wrap {
+  grid-column: 2;
+  grid-row: 1 / 10;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+}
+
+.preview-canvas {
+  border-radius: 6px;
+  background: #060606;
+  border: 1px solid #1e1212;
+  display: block;
+}
+
+.preview-label {
+  font-size: 10px;
+  color: var(--text-muted);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+/* ── Fields ── */
+.fields { grid-column: 1; display: flex; flex-direction: column; gap: 14px; }
+
+.field-row { display: flex; flex-direction: column; gap: 5px; }
+
+.field-label {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+input[type="number"] {
+  background: #0e0808;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  padding: 5px 9px;
+  font-size: 13px;
+  width: 80px;
+  outline: none;
+  transition: border-color 0.15s;
+}
+input[type="number"]:focus { border-color: var(--border-focus); }
+
+/* Color row */
+.color-row { display: flex; align-items: center; gap: 8px; }
+
+input[type="color"] {
+  width: 36px;
+  height: 28px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: none;
+  cursor: pointer;
+  padding: 2px;
+}
+
+.color-hex {
+  background: #0e0808;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  padding: 5px 9px;
+  font-size: 12px;
+  font-family: "SF Mono", Menlo, monospace;
+  width: 90px;
+  outline: none;
+  transition: border-color 0.15s;
+}
+.color-hex:focus { border-color: var(--border-focus); }
+
+/* Slider row */
+.slider-row { display: flex; align-items: center; gap: 10px; }
+
+input[type="range"] {
+  -webkit-appearance: none;
+  flex: 1;
+  height: 4px;
+  background: #2a1a1a;
+  border-radius: 2px;
+  outline: none;
+  cursor: pointer;
+}
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--accent-light);
+  cursor: pointer;
+  border: 2px solid #0c0c0c;
+}
+
+.slider-val {
+  font-size: 12px;
+  font-family: "SF Mono", Menlo, monospace;
+  color: var(--text-dim);
+  min-width: 54px;
+  text-align: right;
+}
+
+/* Toggle row */
+.toggle-row { display: flex; align-items: center; gap: 10px; }
+.toggle-label { flex: 1; }
+
+.toggle {
+  position: relative;
+  width: 36px;
+  height: 20px;
+  flex-shrink: 0;
+}
+.toggle input { opacity: 0; width: 0; height: 0; }
+.toggle-track {
+  position: absolute;
+  inset: 0;
+  border-radius: 10px;
+  background: var(--toggle-off);
+  border: 1px solid #441111;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+.toggle input:checked + .toggle-track { background: var(--toggle-on); border-color: #993300; }
+.toggle-track::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #776666;
+  transition: all 0.2s;
+}
+.toggle input:checked + .toggle-track::after {
+  left: calc(100% - 16px);
+  background: var(--accent-light);
+}
+
+/* Dependent field groups */
+.dep-fields {
+  padding: 10px 12px;
+  border-left: 2px solid var(--accent-dim);
+  margin-left: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+/* ── Add alert button ── */
+#add-alert-btn {
+  display: block;
+  width: 100%;
+  background: none;
+  border: 1px dashed #441111;
+  border-radius: var(--radius);
+  color: #884444;
+  padding: 14px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  letter-spacing: 0.04em;
+  transition: all 0.15s;
+  margin-top: 4px;
+}
+#add-alert-btn:hover { border-color: var(--accent); color: var(--accent-light); background: #110505; }
+
+/* ── Calendars section ── */
+.section-title {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  margin-bottom: 10px;
+}
+
+.calendars-card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px 20px;
+  margin-bottom: 24px;
+}
+
+.cal-hint {
+  color: var(--text-muted);
+  font-size: 12px;
+  margin-top: 8px;
+}
+
+#calendars-input {
+  width: 100%;
+  background: #0e0808;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  padding: 7px 10px;
+  font-size: 12px;
+  font-family: "SF Mono", Menlo, monospace;
+  outline: none;
+  resize: vertical;
+  min-height: 48px;
+  transition: border-color 0.15s;
+}
+#calendars-input:focus { border-color: var(--border-focus); }
+
+/* ── Toast ── */
+#toast {
+  position: fixed;
+  bottom: 28px;
+  left: 50%;
+  transform: translateX(-50%) translateY(20px);
+  background: #1a2a1a;
+  border: 1px solid #335533;
+  color: var(--success);
+  border-radius: var(--radius-sm);
+  padding: 10px 20px;
+  font-size: 13px;
+  font-weight: 600;
+  opacity: 0;
+  transition: opacity 0.2s, transform 0.2s;
+  pointer-events: none;
+}
+#toast.show {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0);
+}
+#toast.error {
+  background: #2a1a1a;
+  border-color: #553333;
+  color: #ff6644;
+}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">⏹</div>
+  <h1><span>Hardstop</span> Config</h1>
+  <button id="save-btn">Save</button>
+</header>
+
+<main>
+  <div class="calendars-card">
+    <div class="section-title">Google Calendar IDs</div>
+    <textarea id="calendars-input" rows="2"
+      placeholder="Leave empty for primary calendar. One ID per line."></textarea>
+    <div class="cal-hint">Find your calendar ID in Google Calendar → Settings → Integrate calendar</div>
+  </div>
+
+  <div class="section-title">Alert Levels <span style="font-weight:400;text-transform:none;letter-spacing:0">(most to least urgent)</span></div>
+  <div id="alerts-container"></div>
+  <button id="add-alert-btn">+ Add Alert Level</button>
+</main>
+
+<div id="toast"></div>
+
+<script>
+// ── State ────────────────────────────────────────────────────────────────────
+
+let state = { calendars: [], alerts: [] };
+let animFrames = {}; // idx → requestAnimationFrame handle
+
+const DEFAULT_ALERT = {
+  minutes_before: 5, color: "#FF8C00",
+  width: 40, blink_hz: 0.5,
+  expand: false, expand_px: 0,
+  gradient: true,
+  snake_mode: false, snake_speed: 80, snake_start: 0.0,
+};
+
+// ── Boot ─────────────────────────────────────────────────────────────────────
+
+async function boot() {
+  try {
+    const r = await fetch("/api/config");
+    const cfg = await r.json();
+    state.calendars = cfg.calendars || [];
+    state.alerts = cfg.alerts || [];
+    document.getElementById("calendars-input").value = state.calendars.join("\n");
+    renderAlerts();
+  } catch(e) {
+    showToast("Failed to load config: " + e, true);
+  }
+}
+
+// ── Render ───────────────────────────────────────────────────────────────────
+
+function renderAlerts() {
+  // Cancel all running previews
+  Object.values(animFrames).forEach(cancelAnimationFrame);
+  animFrames = {};
+
+  const container = document.getElementById("alerts-container");
+  container.innerHTML = "";
+
+  // Sort descending by minutes_before (most urgent last = bottom = highest level number)
+  const sorted = [...state.alerts].map((a, origIdx) => ({ ...a, _origIdx: origIdx }));
+  sorted.sort((a, b) => b.minutes_before - a.minutes_before);
+
+  sorted.forEach((alert, displayIdx) => {
+    const idx = alert._origIdx;
+    const card = buildCard(alert, idx, displayIdx + 1, sorted.length);
+    container.appendChild(card);
+    startPreview(card.querySelector(".preview-canvas"), idx);
+  });
+}
+
+function buildCard(alert, idx, levelNum, total) {
+  const card = document.createElement("div");
+  card.className = "alert-card";
+  card.dataset.idx = idx;
+
+  const urgency = alert.minutes_before === 0 ? "NOW" :
+                  alert.minutes_before === 1  ? "1 minute before" :
+                  `${alert.minutes_before} minutes before`;
+
+  card.innerHTML = `
+    <div class="card-header">
+      <span class="level-badge">Level ${levelNum}</span>
+      <span class="level-title">${urgency}</span>
+      <span class="collapse-arrow">▾</span>
+      <button class="remove-btn" title="Remove this alert level">✕</button>
+    </div>
+    <div class="card-body">
+      <div class="fields">
+
+        <div class="field-row">
+          <div class="field-label">Minutes before meeting</div>
+          <input type="number" class="f-minutes" value="${alert.minutes_before}" min="0" max="120" step="1">
+        </div>
+
+        <div class="field-row">
+          <div class="field-label">Color</div>
+          <div class="color-row">
+            <input type="color" class="f-color" value="${alert.color}">
+            <input type="text"  class="color-hex f-color-hex" value="${alert.color}" maxlength="7">
+          </div>
+        </div>
+
+        <div class="field-row">
+          <div class="field-label">Border width</div>
+          <div class="slider-row">
+            <input type="range" class="f-width" min="10" max="400" value="${alert.width}">
+            <span class="slider-val f-width-val">${alert.width}px</span>
+          </div>
+        </div>
+
+        <div class="field-row">
+          <div class="field-label">Blink rate</div>
+          <div class="slider-row">
+            <input type="range" class="f-blink" min="0" max="10" step="0.1" value="${alert.blink_hz}">
+            <span class="slider-val f-blink-val">${alert.blink_hz} Hz</span>
+          </div>
+        </div>
+
+        <div class="field-row">
+          <div class="toggle-row">
+            <span class="field-label toggle-label">Gradient fade</span>
+            <label class="toggle">
+              <input type="checkbox" class="f-gradient" ${alert.gradient ? "checked" : ""}>
+              <div class="toggle-track"></div>
+            </label>
+          </div>
+        </div>
+
+        <div class="field-row">
+          <div class="toggle-row">
+            <span class="field-label toggle-label">Expand (walls close in)</span>
+            <label class="toggle">
+              <input type="checkbox" class="f-expand" ${alert.expand ? "checked" : ""}>
+              <div class="toggle-track"></div>
+            </label>
+          </div>
+          <div class="dep-fields f-expand-fields" style="${alert.expand ? "" : "display:none"}">
+            <div class="field-row">
+              <div class="field-label">Max expansion</div>
+              <div class="slider-row">
+                <input type="range" class="f-expand-px" min="0" max="600" value="${alert.expand_px}">
+                <span class="slider-val f-expand-px-val">${alert.expand_px}px</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="field-row">
+          <div class="toggle-row">
+            <span class="field-label toggle-label">Snake mode</span>
+            <label class="toggle">
+              <input type="checkbox" class="f-snake" ${alert.snake_mode ? "checked" : ""}>
+              <div class="toggle-track"></div>
+            </label>
+          </div>
+          <div class="dep-fields f-snake-fields" style="${alert.snake_mode ? "" : "display:none"}">
+            <div class="field-row">
+              <div class="field-label">Speed (px/sec)</div>
+              <div class="slider-row">
+                <input type="range" class="f-snake-speed" min="10" max="1200" value="${alert.snake_speed}">
+                <span class="slider-val f-snake-speed-val">${alert.snake_speed} px/s</span>
+              </div>
+            </div>
+            <div class="field-row">
+              <div class="field-label">Starting coverage</div>
+              <div class="slider-row">
+                <input type="range" class="f-snake-start" min="0" max="1" step="0.05" value="${alert.snake_start}">
+                <span class="slider-val f-snake-start-val">${Math.round(alert.snake_start * 100)}%</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+      </div><!-- /fields -->
+
+      <div class="preview-wrap">
+        <canvas class="preview-canvas" width="200" height="130"></canvas>
+        <div class="preview-label">Preview</div>
+      </div>
+    </div><!-- /card-body -->
+  `;
+
+  wireCard(card, idx);
+  return card;
+}
+
+function wireCard(card, idx) {
+  const a = state.alerts[idx];
+
+  // Collapse toggle
+  card.querySelector(".card-header").addEventListener("click", e => {
+    if (e.target.closest(".remove-btn")) return;
+    card.classList.toggle("collapsed");
+  });
+
+  // Remove
+  card.querySelector(".remove-btn").addEventListener("click", () => {
+    if (state.alerts.length <= 1) return; // must keep at least one
+    state.alerts.splice(idx, 1);
+    renderAlerts();
+  });
+
+  // Minutes
+  card.querySelector(".f-minutes").addEventListener("input", e => {
+    a.minutes_before = parseInt(e.target.value) || 0;
+    card.querySelector(".level-title").textContent =
+      a.minutes_before === 0 ? "NOW" :
+      a.minutes_before === 1  ? "1 minute before" :
+      `${a.minutes_before} minutes before`;
+  });
+
+  // Color picker ↔ hex field
+  const colorPicker = card.querySelector(".f-color");
+  const colorHex    = card.querySelector(".f-color-hex");
+  colorPicker.addEventListener("input", e => {
+    a.color = e.target.value;
+    colorHex.value = e.target.value;
+  });
+  colorHex.addEventListener("change", e => {
+    const v = e.target.value;
+    if (/^#[0-9a-fA-F]{6}$/.test(v)) {
+      a.color = v;
+      colorPicker.value = v;
+    }
+  });
+
+  // Width slider
+  const widthSlider = card.querySelector(".f-width");
+  const widthVal    = card.querySelector(".f-width-val");
+  widthSlider.addEventListener("input", e => {
+    a.width = parseInt(e.target.value);
+    widthVal.textContent = `${a.width}px`;
+  });
+
+  // Blink slider
+  const blinkSlider = card.querySelector(".f-blink");
+  const blinkVal    = card.querySelector(".f-blink-val");
+  blinkSlider.addEventListener("input", e => {
+    a.blink_hz = parseFloat(e.target.value);
+    blinkVal.textContent = `${a.blink_hz.toFixed(1)} Hz`;
+  });
+
+  // Gradient toggle
+  card.querySelector(".f-gradient").addEventListener("change", e => {
+    a.gradient = e.target.checked;
+  });
+
+  // Expand toggle
+  const expandCb     = card.querySelector(".f-expand");
+  const expandFields = card.querySelector(".f-expand-fields");
+  expandCb.addEventListener("change", e => {
+    a.expand = e.target.checked;
+    expandFields.style.display = a.expand ? "" : "none";
+  });
+
+  // Expand px slider
+  const expandPxSlider = card.querySelector(".f-expand-px");
+  const expandPxVal    = card.querySelector(".f-expand-px-val");
+  expandPxSlider.addEventListener("input", e => {
+    a.expand_px = parseInt(e.target.value);
+    expandPxVal.textContent = `${a.expand_px}px`;
+  });
+
+  // Snake toggle
+  const snakeCb     = card.querySelector(".f-snake");
+  const snakeFields = card.querySelector(".f-snake-fields");
+  snakeCb.addEventListener("change", e => {
+    a.snake_mode = e.target.checked;
+    snakeFields.style.display = a.snake_mode ? "" : "none";
+  });
+
+  // Snake speed
+  const snakeSpeedSlider = card.querySelector(".f-snake-speed");
+  const snakeSpeedVal    = card.querySelector(".f-snake-speed-val");
+  snakeSpeedSlider.addEventListener("input", e => {
+    a.snake_speed = parseInt(e.target.value);
+    snakeSpeedVal.textContent = `${a.snake_speed} px/s`;
+  });
+
+  // Snake start
+  const snakeStartSlider = card.querySelector(".f-snake-start");
+  const snakeStartVal    = card.querySelector(".f-snake-start-val");
+  snakeStartSlider.addEventListener("input", e => {
+    a.snake_start = parseFloat(e.target.value);
+    snakeStartVal.textContent = `${Math.round(a.snake_start * 100)}%`;
+  });
+}
+
+// ── Preview canvas ────────────────────────────────────────────────────────────
+
+function startPreview(canvas, idx) {
+  if (!canvas) return;
+  canvas._startTime = performance.now() / 1000;
+
+  function frame(ts) {
+    const t = ts / 1000;
+    drawPreview(canvas, state.alerts[idx], t);
+    animFrames[idx] = requestAnimationFrame(frame);
+  }
+  animFrames[idx] = requestAnimationFrame(frame);
+}
+
+function hexToRgb(hex) {
+  const h = hex.replace("#", "");
+  return [
+    parseInt(h.slice(0, 2), 16),
+    parseInt(h.slice(2, 4), 16),
+    parseInt(h.slice(4, 6), 16),
+  ];
+}
+
+function drawPreview(canvas, a, t) {
+  if (!a) return;
+  const ctx = canvas.getContext("2d");
+  const W = canvas.width, H = canvas.height;
+
+  // Scale border width to canvas (relative to a ~3440px ultrawide)
+  const w = Math.max(3, Math.round(a.width * W / 3440 * 40));
+
+  ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = "#060606";
+  ctx.fillRect(0, 0, W, H);
+
+  const [r, g, b] = hexToRgb(a.color || "#ff0000");
+
+  let alpha = 1.0;
+  if (a.blink_hz > 0) {
+    alpha = 0.4 + 0.6 * Math.abs(Math.sin(Math.PI * a.blink_hz * t));
+  }
+
+  if (a.snake_mode) {
+    // Animate snake from snake_start, advancing at snake_speed
+    const hw = w / 2;
+    const segs = [
+      [hw, H - hw, W - hw, H - hw],
+      [W - hw, H - hw, W - hw, hw],
+      [W - hw, hw, hw, hw],
+      [hw, hw, hw, H - hw],
+    ];
+    const segLens = segs.map(([sx, sy, ex, ey]) =>
+      Math.hypot(ex - sx, ey - sy)
+    );
+    const perimeter = segLens.reduce((a, b) => a + b, 0);
+
+    const elapsed = t - (canvas._startTime || t);
+    const speedFrac = (a.snake_speed / 3440) * (W / perimeter) * 4;
+    const coverage = Math.min(1.0, a.snake_start + elapsed * speedFrac);
+
+    ctx.strokeStyle = `rgba(${r},${g},${b},${alpha})`;
+    ctx.lineWidth = w;
+    ctx.lineCap = "butt";
+    ctx.lineJoin = "miter";
+    ctx.beginPath();
+
+    let remaining = coverage * perimeter;
+    let first = true;
+    for (let i = 0; i < segs.length && remaining > 0; i++) {
+      const [sx, sy, ex, ey] = segs[i];
+      if (first) { ctx.moveTo(sx, sy); first = false; }
+      if (remaining >= segLens[i]) {
+        ctx.lineTo(ex, ey);
+        remaining -= segLens[i];
+      } else {
+        const f = remaining / segLens[i];
+        ctx.lineTo(sx + f * (ex - sx), sy + f * (ey - sy));
+        remaining = 0;
+      }
+    }
+    ctx.stroke();
+
+  } else {
+    const color = `rgba(${r},${g},${b},${alpha})`;
+    const clear  = `rgba(${r},${g},${b},0)`;
+
+    // [x, y, sw, sh, gradX0, gradY0, gradX1, gradY1]
+    const strips = [
+      [0,     H - w, W, w, 0, H - w, 0, H],      // top
+      [0,     0,     W, w, 0, w,     0, 0],        // bottom
+      [0,     0,     w, H, w, 0,     0, 0],        // left
+      [W - w, 0,     w, H, W - w, 0, W, 0],        // right
+    ];
+
+    for (const [x, y, sw, sh, x0, y0, x1, y1] of strips) {
+      if (a.gradient) {
+        const grad = ctx.createLinearGradient(x0, y0, x1, y1);
+        grad.addColorStop(0, clear);
+        grad.addColorStop(1, color);
+        ctx.fillStyle = grad;
+      } else {
+        ctx.fillStyle = color;
+      }
+      ctx.fillRect(x, y, sw, sh);
+    }
+  }
+}
+
+// ── Save ─────────────────────────────────────────────────────────────────────
+
+document.getElementById("save-btn").addEventListener("click", async () => {
+  const calsRaw = document.getElementById("calendars-input").value.trim();
+  state.calendars = calsRaw ? calsRaw.split("\n").map(s => s.trim()).filter(Boolean) : [];
+
+  try {
+    const r = await fetch("/api/config", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ calendars: state.calendars, alerts: state.alerts }),
+    });
+    const data = await r.json();
+    if (data.ok) {
+      showToast("✓ Saved — restart Hardstop to apply");
+    } else {
+      showToast("Save failed: " + (data.error || "unknown"), true);
+    }
+  } catch(e) {
+    showToast("Save failed: " + e, true);
+  }
+});
+
+// ── Add alert ────────────────────────────────────────────────────────────────
+
+document.getElementById("add-alert-btn").addEventListener("click", () => {
+  state.alerts.push({ ...DEFAULT_ALERT, minutes_before: 10 });
+  renderAlerts();
+  // Scroll to the new card
+  const cards = document.querySelectorAll(".alert-card");
+  cards[cards.length - 1].scrollIntoView({ behavior: "smooth" });
+});
+
+// ── Toast ─────────────────────────────────────────────────────────────────────
+
+let _toastTimer = null;
+function showToast(msg, isError = false) {
+  const t = document.getElementById("toast");
+  t.textContent = msg;
+  t.className = "show" + (isError ? " error" : "");
+  if (_toastTimer) clearTimeout(_toastTimer);
+  _toastTimer = setTimeout(() => { t.className = ""; }, 3000);
+}
+
+// ── Go ───────────────────────────────────────────────────────────────────────
+boot();
+</script>
+</body>
+</html>
+"""
 
 # ── Entry point ──────────────────────────────────────────────────────────────
 
