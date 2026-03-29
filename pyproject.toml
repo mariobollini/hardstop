@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "hardstop"
 version = "0.1.0"
-description = "Google Calendar & deadline overlay for ultrawide monitors"
+description = "Meeting countdown overlays for macOS — escalating screen-border animations so you never miss a meeting on an ultrawide monitor"
 requires-python = ">=3.11"
 dependencies = [
     "pyobjc-framework-Cocoa>=10.0",
