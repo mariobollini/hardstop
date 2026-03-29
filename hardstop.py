@@ -250,6 +250,10 @@ def _try_load_cached_token() -> bool:
         with _calendar_lock:
             _calendar_service = build("calendar", "v3", credentials=creds)
         _fetch_calendar_account()
+        if _app_delegate:
+            _app_delegate.performSelectorOnMainThread_withObject_waitUntilDone_(
+                "refreshMenuLabels:", None, False
+            )
         print("Google Calendar: loaded cached credentials.")
         return True
     except Exception as e:
