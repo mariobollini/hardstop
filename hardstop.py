@@ -281,7 +281,7 @@ def _get_oauth_client_config() -> dict | None:
     return None
 
 
-def authorize_calendar() -> bool:
+def authorize_calendar(force: bool = False) -> bool:
     global _calendar_service
     try:
         from google.oauth2.credentials import Credentials
@@ -303,6 +303,9 @@ def authorize_calendar() -> bool:
             "Hardstop will continue running in manual-hardstop-only mode."
         )
         return False
+
+    if force and TOKEN_PATH.exists():
+        TOKEN_PATH.unlink()
 
     creds = None
     if TOKEN_PATH.exists():
@@ -1585,7 +1588,7 @@ class _AppDelegate(NSObject):
         threading.Timer(0.5, lambda: subprocess.run(["open", url], check=False)).start()
 
     def authorizeCalendar_(self, _sender) -> None:
-        threading.Thread(target=authorize_calendar, daemon=True).start()
+        threading.Thread(target=authorize_calendar, args=(True,), daemon=True).start()
 
     def toggleLoginItem_(self, sender) -> None:
         enabled = not _login_item_enabled()
@@ -1660,7 +1663,7 @@ def _run_config_server() -> None:
 
     @app.post("/api/authorize")
     def do_authorize():
-        threading.Thread(target=authorize_calendar, daemon=True).start()
+        threading.Thread(target=authorize_calendar, args=(True,), daemon=True).start()
         return jsonify({"ok": True})
 
     @app.get("/api/preview/<int:n>")
