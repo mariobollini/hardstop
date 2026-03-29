@@ -1383,7 +1383,6 @@ class _AppDelegate(NSObject):
         self._next_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
             self._next_event_label(), None, ""
         )
-        self._next_item.setEnabled_(False)
         menu.addItem_(self._next_item)
 
         # Active hardstop row (hidden when none set)
