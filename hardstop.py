@@ -8,8 +8,7 @@ can't miss a meeting even on a giant ultrawide.
 
 Setup:
   pip install -e .
-  # Place client_secret.json at ~/.hardstop/client_secret.json
-  hardstop   # opens browser for Google auth on first run
+  hardstop   # starts in manual mode; add Google credentials to ~/.hardstop/config.yaml for calendar sync
 """
 
 import json
@@ -38,44 +37,36 @@ _OVERLAY_LEVEL = 1001
 
 DEFAULT_CONFIG = {
     "calendars": [],
-    "popup_font": "modern",   # "modern" | "retro"
-    "popup_pos":  "center",   # "center" | "top" | "snake"
+    "popup_font": "retro",
+    "popup_pos":  "center",   # global fallback
+    "default_name": "You have a hard stop!",
     "alerts": [
         {
             "minutes_before": 5,
-            "color": "#FF8C00",
+            "color": "#FFCC00",
             "width": 40,
             "blink_hz": 0.5,
-            "expand": False,
-            "gradient": True,
-            "snake_mode": False,
-            "snake_speed": 80,
-            "snake_start": 0.0,
-            "game_over": False,
+            "effect": "fade",
+            "snake_speed": 300,
+            "popup_pos": "center",
         },
         {
             "minutes_before": 2,
-            "color": "#FF4500",
+            "color": "#FF6600",
             "width": 80,
             "blink_hz": 2.0,
-            "expand": True,
-            "gradient": True,
-            "snake_mode": False,
-            "snake_speed": 160,
-            "snake_start": 0.25,
-            "game_over": False,
+            "effect": "expand",
+            "snake_speed": 300,
+            "popup_pos": "center",
         },
         {
             "minutes_before": 0,
             "color": "#FF0000",
             "width": 120,
             "blink_hz": 4.0,
-            "expand": False,
-            "gradient": False,
-            "snake_mode": False,
-            "snake_speed": 320,
-            "snake_start": 0.5,
-            "game_over": False,
+            "effect": "game_over",
+            "snake_speed": 300,
+            "popup_pos": "center",
         },
     ],
 }
@@ -95,7 +86,24 @@ def load_config() -> dict:
     try:
         with open(CONFIG_PATH) as f:
             data = yaml.safe_load(f) or {}
-        return {**DEFAULT_CONFIG, **data}
+        cfg = {**DEFAULT_CONFIG, **data}
+        # Migrate old flags to unified effect field
+        for alert in cfg.get("alerts", []):
+            if "effect" not in alert:
+                if alert.get("game_over"):
+                    alert["effect"] = "game_over"
+                elif alert.get("snake_mode"):
+                    alert["effect"] = "snake"
+                elif alert.get("expand"):
+                    alert["effect"] = "expand"
+                elif alert.get("gradient"):
+                    alert["effect"] = "fade"
+                else:
+                    alert["effect"] = "normal"
+            # Migrate: add per-alert popup_pos if missing
+            if "popup_pos" not in alert:
+                alert["popup_pos"] = cfg.get("popup_pos", "center")
+        return cfg
     except Exception as e:
         print(f"Config load error: {e} — using defaults.")
         return DEFAULT_CONFIG.copy()
@@ -104,6 +112,13 @@ def load_config() -> dict:
 def _hex_to_rgb(hex_str: str) -> tuple[float, float, float]:
     h = hex_str.lstrip("#")
     return int(h[0:2], 16) / 255, int(h[2:4], 16) / 255, int(h[4:6], 16) / 255
+
+
+def _popup_accent_rgb(r: float, g: float, b: float) -> tuple[float, float, float]:
+    """If the configured color is near-black, use red for popup accents so they remain visible."""
+    if r + g + b < 0.18:   # ~6% brightness threshold
+        return 1.0, 0.0, 0.0
+    return r, g, b
 
 
 # ── LaunchAgent (Open at Login) ──────────────────────────────────────────────
@@ -143,6 +158,30 @@ def _set_login_item(enabled: bool) -> None:
 
 
 # ── Menu bar icon (stop-sign octagon) ───────────────────────────────────────
+
+def _make_octagon_icon_colored():
+    """64×64 red filled octagon for use in NSAlert dialogs."""
+    from AppKit import NSImage, NSBezierPath, NSColor
+    W, H = 64.0, 64.0
+    cx, cy = W / 2, H / 2
+    r = W / 2 - 4
+    image = NSImage.alloc().initWithSize_((W, H))
+    image.lockFocus()
+    path = NSBezierPath.bezierPath()
+    for i in range(8):
+        angle = math.radians(22.5 + i * 45)
+        x = cx + r * math.cos(angle)
+        y = cy + r * math.sin(angle)
+        if i == 0:
+            path.moveToPoint_((x, y))
+        else:
+            path.lineToPoint_((x, y))
+    path.closePath()
+    NSColor.colorWithRed_green_blue_alpha_(0.8, 0.13, 0.0, 1.0).set()
+    path.fill()
+    image.unlockFocus()
+    return image
+
 
 def _make_octagon_icon(filled: bool = False):
     from AppKit import NSImage, NSBezierPath, NSColor
@@ -208,6 +247,35 @@ def _try_load_cached_token() -> bool:
         return False
 
 
+def _get_oauth_client_config() -> dict | None:
+    """Return OAuth client config dict, or None if not configured.
+
+    Checks config.yaml first (oauth.client_id / oauth.client_secret), then
+    falls back to client_secret.json for backwards compatibility.
+    """
+    cfg = load_config()
+    oauth = cfg.get("oauth", {})
+    client_id     = oauth.get("client_id", "").strip()
+    client_secret = oauth.get("client_secret", "").strip()
+
+    if client_id and client_secret:
+        return {
+            "installed": {
+                "client_id":                  client_id,
+                "client_secret":              client_secret,
+                "redirect_uris":              ["http://localhost"],
+                "auth_uri":                   "https://accounts.google.com/o/oauth2/auth",
+                "token_uri":                  "https://oauth2.googleapis.com/token",
+            }
+        }
+
+    if CLIENT_SECRET_PATH.exists():
+        import json as _json
+        return _json.loads(CLIENT_SECRET_PATH.read_text())
+
+    return None
+
+
 def authorize_calendar() -> bool:
     global _calendar_service
     try:
@@ -219,10 +287,20 @@ def authorize_calendar() -> bool:
         print("Missing Google libraries. Run: pip install google-api-python-client google-auth-oauthlib")
         return False
 
-    if not CLIENT_SECRET_PATH.exists():
+    client_config = _get_oauth_client_config()
+    if not client_config:
         print(
-            f"client_secret.json not found at {CLIENT_SECRET_PATH}\n"
-            "Download OAuth credentials from console.cloud.google.com and place it there."
+            "Google Calendar credentials not configured.\n"
+            "Add your OAuth client ID and secret to ~/.hardstop/config.yaml:\n"
+            "\n"
+            "  oauth:\n"
+            "    client_id: \"YOUR_CLIENT_ID.apps.googleusercontent.com\"\n"
+            "    client_secret: \"YOUR_CLIENT_SECRET\"\n"
+            "\n"
+            "Get credentials at: console.cloud.google.com → APIs & Services → Credentials\n"
+            "(Create an OAuth 2.0 Client ID, type: Desktop app)\n"
+            "\n"
+            "Hardstop will continue running in manual-hardstop-only mode."
         )
         return False
 
@@ -237,9 +315,7 @@ def authorize_calendar() -> bool:
             except Exception:
                 creds = None
         if not creds:
-            flow = InstalledAppFlow.from_client_secrets_file(
-                str(CLIENT_SECRET_PATH), CALENDAR_SCOPES
-            )
+            flow = InstalledAppFlow.from_client_config(client_config, CALENDAR_SCOPES)
             creds = flow.run_local_server(port=0)
         APP_DIR.mkdir(parents=True, exist_ok=True)
         TOKEN_PATH.write_text(creds.to_json())
@@ -317,20 +393,24 @@ def parse_hardstop_input(text: str) -> datetime | None:
     """
     Parse user input into a future datetime (timezone-aware, local time).
 
-    Accepted formats:
-      "4:55pm", "4:55 PM", "16:55"  — time of day (today or tomorrow if past)
-      "30m", "30min", "30 min"       — 30 minutes from now
-      "1h", "1h30m", "1 hour 30 min" — duration from now
-      "45"                            — bare integer = minutes from now
+    Very permissive — accepts many formats:
+      "4:55pm", "4:55 PM", "16:55", "455pm"  — time of day
+      "30m", "30min", "30 mins", "30 minutes" — 30 minutes from now
+      "5min", "5 min"                          — 5 minutes from now
+      "1h", "1h30m", "1 hour 30 min"           — duration from now
+      "45"                                     — bare integer = minutes from now
     """
-    text = text.strip().lower()
-    # Normalise unit aliases before collapsing spaces
-    text = re.sub(r"\bhours?\b", "h", text)
-    text = re.sub(r"\bmin(?:utes?)?\b", "m", text)
-    text = re.sub(r"\s+", "", text)   # drop all remaining spaces
+    orig = text.strip()
+    text = orig.lower().strip()
+
+    # Normalise unit aliases (no \b at digit-letter boundary, e.g. "5min")
+    text = re.sub(r"hours?", "h", text)
+    text = re.sub(r"min(?:utes?|s)?", "m", text)
+    text = re.sub(r"\s+", "", text)   # collapse all spaces
+
     now = datetime.now().astimezone()
 
-    # Hours + minutes: "1h30m", "30m", "90m"
+    # Hours + minutes: "1h30m", "30m", "5m", "90m"
     m = re.fullmatch(r"(?:(\d+)h)?(\d+)m", text)
     if m:
         hours = int(m.group(1) or 0)
@@ -350,16 +430,17 @@ def parse_hardstop_input(text: str) -> datetime | None:
         if mins > 0:
             return now + timedelta(minutes=mins)
 
-    # Time of day
-    for fmt in ("%I:%M%p", "%H:%M", "%I%p"):
-        try:
-            t = datetime.strptime(text, fmt)
-            result = now.replace(hour=t.hour, minute=t.minute, second=0, microsecond=0)
-            if result <= now:
-                result += timedelta(days=1)
-            return result
-        except ValueError:
-            continue
+    # Time of day — try a wide variety of formats on the normalised and original text
+    for src in (text, orig.lower().replace(" ", "")):
+        for fmt in ("%I:%M%p", "%H:%M", "%I%p", "%I:%M", "%I%M%p", "%H%M"):
+            try:
+                t = datetime.strptime(src, fmt)
+                result = now.replace(hour=t.hour, minute=t.minute, second=0, microsecond=0)
+                if result <= now:
+                    result += timedelta(days=1)
+                return result
+            except ValueError:
+                continue
 
     return None
 
@@ -404,6 +485,8 @@ class AlertScheduler:
 
         for event_id, label, start_dt in events:
             for alert in alerts_desc:
+                if alert.get("effect") == "none":
+                    continue  # level disabled — no alarm
                 mins = alert["minutes_before"]
                 target = start_dt - timedelta(minutes=mins)
                 key = (event_id, mins)
@@ -442,13 +525,14 @@ class _BorderView(NSView):
         self._cfg = None
         self._extra_width = 0.0
         self._snake_coverage = 0.0
+        self._click_cb = None
         return self
 
     @objc.python_method
     def configure(self, alert_cfg: dict) -> None:
         self._cfg = alert_cfg
         self._extra_width = 0.0
-        self._snake_coverage = alert_cfg.get("snake_start", 0.0)
+        self._snake_coverage = 0.0
         self.setNeedsDisplay_(True)
 
     @objc.python_method
@@ -458,14 +542,14 @@ class _BorderView(NSView):
 
     @objc.python_method
     def set_snake_coverage(self, coverage: float) -> None:
-        self._snake_coverage = min(1.0, max(0.0, coverage))
+        self._snake_coverage = max(0.0, coverage)  # raw total, may exceed 1.0
         self.setNeedsDisplay_(True)
 
     def drawRect_(self, rect):
         if not self._cfg:
             return
 
-        from AppKit import NSColor
+        from AppKit import NSColor, NSBezierPath
         from Foundation import NSMakeRect
 
         cfg = self._cfg
@@ -474,87 +558,120 @@ class _BorderView(NSView):
         fw = self.frame().size.width
         fh = self.frame().size.height
         color = NSColor.colorWithRed_green_blue_alpha_(r, g, b, 1.0)
+        effect = cfg.get("effect", "normal")
 
-        if cfg.get("snake_mode", False):
+        if effect == "none":
+            return
+        elif effect == "snake":
             self._draw_snake(fw, fh, w, color)
+        elif effect == "game_over":
+            NSColor.colorWithRed_green_blue_alpha_(r, g, b, 1.0).set()
+            NSBezierPath.fillRect_(NSMakeRect(0, 0, fw, fh))
+        elif effect == "expand":
+            self._draw_border_gradient(fw, fh, w, r, g, b)
         else:
             self._draw_border(fw, fh, w, color, cfg)
 
     @objc.python_method
     def _draw_border(self, fw, fh, w, color, cfg):
-        from AppKit import NSBezierPath, NSGradient, NSColor
+        from AppKit import NSBezierPath
         from Foundation import NSMakeRect
 
-        use_gradient = cfg.get("gradient", False) or cfg.get("expand", False)
-        r, g, b = _hex_to_rgb(cfg.get("color", "#FF0000"))
+        # Flat solid border — no gradients
+        color.set()
+        for rect in [
+            NSMakeRect(0,      fh - w, fw, w),   # top
+            NSMakeRect(0,      0,      fw, w),   # bottom
+            NSMakeRect(0,      0,      w,  fh),  # left
+            NSMakeRect(fw - w, 0,      w,  fh),  # right
+        ]:
+            NSBezierPath.fillRect_(rect)
+
+    @objc.python_method
+    def _draw_border_gradient(self, fw, fh, w, r, g, b):
+        """Gradient border: solid at screen edge fading to transparent inward (expand effect)."""
+        from AppKit import NSGradient, NSColor
+        from Foundation import NSMakeRect
+
+        solid = NSColor.colorWithRed_green_blue_alpha_(r, g, b, 1.0)
         clear = NSColor.colorWithRed_green_blue_alpha_(r, g, b, 0.0)
+        grad  = NSGradient.alloc().initWithColors_([solid, clear])
 
-        # Angle: 0=left→right, 90=bottom→top, 180=right→left, 270=top→bottom
-        # [clear, color]: inner edge = transparent, outer edge = solid
-        strips = [
-            (NSMakeRect(0,      fh - w, fw, w), 90),   # top
-            (NSMakeRect(0,      0,      fw, w), 270),  # bottom
-            (NSMakeRect(0,      0,      w,  fh), 180), # left
-            (NSMakeRect(fw - w, 0,      w,  fh), 0),   # right
-        ]
-
-        for strip, angle in strips:
-            if use_gradient:
-                NSGradient.alloc().initWithColors_([clear, color]).drawInRect_angle_(strip, angle)
-            else:
-                color.set()
-                NSBezierPath.fillRect_(strip)
+        # NSGradient angle: 0°=left→right, 90°=bottom→top, 180°=right→left, 270°=top→bottom
+        grad.drawInRect_angle_(NSMakeRect(0,      fh - w, fw, w), 270.0)  # top strip
+        grad.drawInRect_angle_(NSMakeRect(0,      0,      fw, w),  90.0)  # bottom strip
+        grad.drawInRect_angle_(NSMakeRect(0,      0,      w,  fh),   0.0)  # left strip
+        grad.drawInRect_angle_(NSMakeRect(fw - w, 0,      w,  fh), 180.0)  # right strip
 
     @objc.python_method
     def _draw_snake(self, fw, fh, w, color):
         """
-        Clockwise snake crawling around the border center-line.
-        Hard edges (NSButtLineCapStyle). Coverage [0,1] drives how far it extends.
+        Continuous rectangular spiral drawn as ONE stroke path.
+        Each ring uses a shortened top edge + vertical inward step to connect
+        seamlessly to the next ring — no separate closed rects, no corner gaps.
+        NSView coords: y=0 at bottom, clockwise = right↓ bottom← left↑ top→.
         """
         from AppKit import NSBezierPath, NSButtLineCapStyle, NSMiterLineJoinStyle
 
-        hw = w / 2  # center-line offset from screen edge
-
-        # Clockwise from top-left: top → right → bottom → left
-        segments = [
-            (hw,      fh - hw, fw - hw, fh - hw),  # top
-            (fw - hw, fh - hw, fw - hw, hw),        # right
-            (fw - hw, hw,      hw,      hw),         # bottom
-            (hw,      hw,      hw,      fh - hw),   # left
-        ]
-
-        seg_lengths = [
-            math.hypot(ex - sx, ey - sy)
-            for sx, sy, ex, ey in segments
-        ]
-        perimeter = sum(seg_lengths)
-        target_len = self._snake_coverage * perimeter
-        if target_len <= 0:
-            return
+        gap        = 2.0
+        ring_pitch = w + gap
+        loop_count = int(self._snake_coverage)
+        frac       = self._snake_coverage - loop_count
 
         path = NSBezierPath.bezierPath()
         path.setLineWidth_(w)
         path.setLineCapStyle_(NSButtLineCapStyle)
         path.setLineJoinStyle_(NSMiterLineJoinStyle)
 
-        remaining = target_len
-        first = True
-        for (sx, sy, ex, ey), seg_len in zip(segments, seg_lengths):
-            if remaining <= 0:
-                break
-            if first:
-                path.moveToPoint_((sx, sy))
-                first = False
-            if remaining >= seg_len:
-                path.lineToPoint_((ex, ey))
-                remaining -= seg_len
-            else:
-                t = remaining / seg_len
-                path.lineToPoint_((sx + t * (ex - sx), sy + t * (ey - sy)))
-                remaining = 0
+        started = False
 
-        color.set()
-        path.stroke()
+        for ring_idx in range(loop_count + 1):
+            inset = ring_idx * ring_pitch
+            hw    = w / 2.0 + inset
+            if hw + w / 2.0 >= min(fw, fh) / 2.0:
+                break
+
+            is_partial = (ring_idx == loop_count)
+
+            # Every ring — partial or complete — uses the same 5-segment layout:
+            #   right↓, bottom←, left↑, top→(shortened by ring_pitch), step↓ inward
+            # The step lands exactly at the next ring's top-right start, making the
+            # spiral one unbroken continuous line with clean 90° corners.
+            segs = [
+                (fw - hw,             fh - hw,             fw - hw,              hw              ),  # right ↓
+                (fw - hw,             hw,                  hw,                   hw              ),  # bottom ←
+                (hw,                  hw,                  hw,                   fh - hw         ),  # left ↑
+                (hw,                  fh - hw,             fw - hw - ring_pitch, fh - hw         ),  # top → (short)
+                (fw - hw - ring_pitch, fh - hw,            fw - hw - ring_pitch, fh - hw - ring_pitch),  # step ↓
+            ]
+            seg_lengths = [math.hypot(ex - sx, ey - sy) for sx, sy, ex, ey in segs]
+            total_len   = sum(seg_lengths)
+            target_len  = (frac * total_len) if is_partial else total_len
+
+            if target_len <= 0:
+                break
+
+            remaining = target_len
+            for (sx, sy, ex, ey), seg_len in zip(segs, seg_lengths):
+                if remaining <= 0:
+                    break
+                if not started:
+                    path.moveToPoint_((sx, sy))
+                    started = True
+                if remaining >= seg_len:
+                    path.lineToPoint_((ex, ey))
+                    remaining -= seg_len
+                else:
+                    t = remaining / seg_len
+                    path.lineToPoint_((sx + t * (ex - sx), sy + t * (ey - sy)))
+                    remaining = 0
+
+            if is_partial:
+                break
+
+        if started:
+            color.set()
+            path.stroke()
 
     @objc.python_method
     def snake_head_position(self) -> tuple:
@@ -582,6 +699,16 @@ class _BorderView(NSView):
             remaining -= seg_len
         return segments[-1][2], segments[-1][3]
 
+    def mouseDown_(self, event):
+        pass  # accept so mouseUp_ fires
+
+    def mouseUp_(self, event):
+        if self._click_cb:
+            self._click_cb()
+
+    def acceptsFirstMouse_(self, event):
+        return True
+
     def isOpaque(self):
         return False
 
@@ -601,8 +728,10 @@ class _BannerView(NSView):
         self._label      = ""
         self._start_dt   = None
         self._cfg        = None
-        self._popup_font = "modern"
-        self._game_over  = False
+        self._popup_font = "retro"
+        self._game_over       = False
+        self._at_start        = False
+        self._dismiss_pending = False
         self._snooze_cb  = None
         self._dismiss_cb = None
         self._snooze_rect  = None
@@ -617,7 +746,9 @@ class _BannerView(NSView):
         self._start_dt   = start_dt
         self._cfg        = alert_cfg
         self._popup_font = popup_font
-        self._game_over  = game_over
+        self._game_over       = game_over
+        self._at_start        = alert_cfg.get("minutes_before", 0) == 0
+        self._dismiss_pending = False
         self._snooze_cb  = snooze_cb
         self._dismiss_cb = dismiss_cb
         self.setNeedsDisplay_(True)
@@ -629,8 +760,15 @@ class _BannerView(NSView):
         secs = int((self._start_dt - datetime.now(tz=timezone.utc)).total_seconds())
         if secs > 0:
             m, s = divmod(secs, 60)
-            return f"in {m}:{s:02d}"
+            return f"{m}:{s:02d}"
         return "NOW"
+
+    @objc.python_method
+    def _event_time(self) -> str:
+        if not self._start_dt:
+            return ""
+        local = self._start_dt.astimezone()
+        return local.strftime("%H:%M")
 
     @objc.python_method
     def _accent_color(self):
@@ -639,211 +777,156 @@ class _BannerView(NSView):
         return NSColor.colorWithRed_green_blue_alpha_(r, g, b, 1.0)
 
     def drawRect_(self, rect):
-        if self._game_over:
-            self._draw_game_over()
-        elif self._popup_font == "retro":
-            self._draw_retro()
-        else:
-            self._draw_modern()
-
-    @objc.python_method
-    def _draw_modern(self):
-        from AppKit import (
-            NSColor, NSBezierPath, NSAttributedString, NSFont,
-            NSMutableParagraphStyle, NSForegroundColorAttributeName,
-            NSFontAttributeName, NSParagraphStyleAttributeName,
-            NSCenterTextAlignment, NSLeftTextAlignment,
-        )
-        from Foundation import NSMakeRect
-
-        fw, fh = self.frame().size.width, self.frame().size.height
-        pad, radius = 20.0, 20.0
-
-        # Background pill
-        NSColor.colorWithRed_green_blue_alpha_(0.04, 0.04, 0.06, 0.95).set()
-        pill = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
-            NSMakeRect(0, 0, fw, fh), radius, radius)
-        pill.fill()
-        self._accent_color().colorWithAlphaComponent_(0.85).set()
-        pill.setLineWidth_(2.0)
-        pill.stroke()
-
-        btn_w, btn_h = 92.0, 36.0
-        btn_gap = 10.0
-        btn_y = (fh - btn_h) / 2
-        dismiss_x = fw - pad - btn_w
-        snooze_x  = dismiss_x - btn_gap - btn_w
-        text_w    = snooze_x - pad - 12.0
-        self._dismiss_rect = (dismiss_x, btn_y, btn_w, btn_h)
-        self._snooze_rect  = (snooze_x,  btn_y, btn_w, btn_h)
-
-        cps = NSMutableParagraphStyle.new(); cps.setAlignment_(NSCenterTextAlignment)
-        lps = NSMutableParagraphStyle.new(); lps.setAlignment_(NSLeftTextAlignment)
-
-        NSAttributedString.alloc().initWithString_attributes_(self._label, {
-            NSFontAttributeName: NSFont.boldSystemFontOfSize_(24),
-            NSForegroundColorAttributeName: NSColor.whiteColor(),
-            NSParagraphStyleAttributeName: lps,
-        }).drawInRect_(NSMakeRect(pad, fh / 2 + 2, text_w, 30))
-
-        NSAttributedString.alloc().initWithString_attributes_(self._countdown(), {
-            NSFontAttributeName: NSFont.systemFontOfSize_(15),
-            NSForegroundColorAttributeName: NSColor.colorWithWhite_alpha_(0.65, 1.0),
-            NSParagraphStyleAttributeName: lps,
-        }).drawInRect_(NSMakeRect(pad, fh / 2 - 20, text_w, 20))
-
-        self._draw_btn("Snooze",  self._snooze_rect,  primary=False, cps=cps, font_size=13)
-        self._draw_btn("Dismiss", self._dismiss_rect, primary=True,  cps=cps, font_size=13)
+        self._draw_retro()
 
     @objc.python_method
     def _draw_retro(self):
         from AppKit import (
-            NSColor, NSBezierPath, NSAttributedString, NSFont,
-            NSMutableParagraphStyle, NSForegroundColorAttributeName,
+            NSColor, NSBezierPath, NSMutableAttributedString, NSAttributedString,
+            NSFont, NSMutableParagraphStyle, NSForegroundColorAttributeName,
             NSFontAttributeName, NSParagraphStyleAttributeName,
-            NSCenterTextAlignment, NSLeftTextAlignment,
+            NSKernAttributeName, NSCenterTextAlignment, NSLeftTextAlignment,
         )
-        from Foundation import NSMakeRect
+        from Foundation import NSMakeRect, NSMakeRange
 
         fw, fh = self.frame().size.width, self.frame().size.height
         pad = 20.0
 
-        # Dark terminal background — sharp corners
-        NSColor.colorWithRed_green_blue_alpha_(0.0, 0.05, 0.02, 0.97).set()
+        r_c, g_c, b_c = _hex_to_rgb(self._cfg.get("color", "#FF8C00")) if self._cfg else (1.0, 0.5, 0.0)
+        r_c, g_c, b_c = _popup_accent_rgb(r_c, g_c, b_c)
+        accent = NSColor.colorWithRed_green_blue_alpha_(r_c, g_c, b_c, 1.0)
+
+        # Dark terminal background — sharp corners, accent border
+        NSColor.colorWithRed_green_blue_alpha_(0.02, 0.02, 0.02, 0.97).set()
         NSBezierPath.fillRect_(NSMakeRect(0, 0, fw, fh))
-        # Green border
-        NSColor.colorWithRed_green_blue_alpha_(0.0, 0.85, 0.3, 1.0).set()
         border = NSBezierPath.bezierPathWithRect_(NSMakeRect(0, 0, fw, fh))
         border.setLineWidth_(2.0)
+        accent.set()
         border.stroke()
 
-        # Retro font: prefer Press Start 2P (if installed), fall back to Monaco
         def retro_font(size):
             f = NSFont.fontWithName_size_("Press Start 2P", size)
             if f is None:
                 f = NSFont.fontWithName_size_("Monaco", size)
             return f or NSFont.boldSystemFontOfSize_(size)
 
-        btn_w, btn_h = 92.0, 36.0
+        # Button layout: single OK when game_over or at_start; else Dismiss(left) Snooze(right)
+        single_btn = self._game_over or self._at_start
+        btn_w, btn_h = 100.0, 50.0
         btn_gap = 10.0
-        btn_y = (fh - btn_h) / 2
-        dismiss_x = fw - pad - btn_w
-        snooze_x  = dismiss_x - btn_gap - btn_w
-        text_w    = snooze_x - pad - 12.0
-        self._dismiss_rect = (dismiss_x, btn_y, btn_w, btn_h)
-        self._snooze_rect  = (snooze_x,  btn_y, btn_w, btn_h)
+        btn_y = (fh - btn_h) / 2.0
+
+        if single_btn:
+            ok_x = fw - pad - btn_w
+            self._dismiss_rect = (ok_x, btn_y, btn_w, btn_h)
+            self._snooze_rect  = None
+            text_right = ok_x - 14.0
+        else:
+            snooze_x  = fw - pad - btn_w
+            dismiss_x = snooze_x - btn_gap - btn_w
+            self._snooze_rect  = (snooze_x,  btn_y, btn_w, btn_h)
+            self._dismiss_rect = (dismiss_x, btn_y, btn_w, btn_h)
+            text_right = dismiss_x - 14.0
 
         cps = NSMutableParagraphStyle.new(); cps.setAlignment_(NSCenterTextAlignment)
         lps = NSMutableParagraphStyle.new(); lps.setAlignment_(NSLeftTextAlignment)
-        green = NSColor.colorWithRed_green_blue_alpha_(0.0, 0.95, 0.35, 1.0)
-        dim_green = NSColor.colorWithRed_green_blue_alpha_(0.0, 0.60, 0.25, 1.0)
 
-        NSAttributedString.alloc().initWithString_attributes_(
-                self._label.upper(), {
-            NSFontAttributeName: retro_font(18),
-            NSForegroundColorAttributeName: green,
-            NSParagraphStyleAttributeName: lps,
-        }).drawInRect_(NSMakeRect(pad, fh / 2 + 2, text_w, 28))
+        # Text row: countdown (accent) + event time + name (white)
+        # In dismiss-pending state: show confirm message instead
+        font_size  = 19.0
+        line_h     = font_size + 8
+        text_y     = (fh - line_h) / 2.0
 
-        NSAttributedString.alloc().initWithString_attributes_(
-                f"> {self._countdown()}", {
-            NSFontAttributeName: retro_font(11),
-            NSForegroundColorAttributeName: dim_green,
-            NSParagraphStyleAttributeName: lps,
-        }).drawInRect_(NSMakeRect(pad, fh / 2 - 20, text_w, 20))
+        if self._dismiss_pending:
+            confirm_text = "CLEARS ALL REMINDERS FOR THIS EVENT"
+            confirm_font_size = font_size * 0.7
+            line_h  = confirm_font_size + 4
+            text_y  = (fh - line_h) / 2.0
+            ms = NSMutableAttributedString.alloc().initWithString_attributes_(confirm_text, {
+                NSFontAttributeName:            retro_font(confirm_font_size),
+                NSForegroundColorAttributeName: accent,
+                NSParagraphStyleAttributeName:  cps,
+                NSKernAttributeName:            1.5,
+            })
+        else:
+            countdown  = self._countdown()
+            event_time = self._event_time()
+            rest = f"  {event_time}  {self._label.upper()}" if event_time else f"  {self._label.upper()}"
+            ms = NSMutableAttributedString.alloc().initWithString_attributes_(
+                countdown + rest, {
+                    NSFontAttributeName:            retro_font(font_size),
+                    NSForegroundColorAttributeName: NSColor.whiteColor(),
+                    NSParagraphStyleAttributeName:  lps,
+                    NSKernAttributeName:            2.0,
+                }
+            )
+            # Countdown in accent color for emphasis
+            ms.addAttribute_value_range_(
+                NSForegroundColorAttributeName, accent, NSMakeRange(0, len(countdown))
+            )
 
-        self._draw_btn("SNOOZE",  self._snooze_rect,  primary=False, cps=cps,
-                       font_size=10, font_name="Monaco")
-        self._draw_btn("DISMISS", self._dismiss_rect, primary=True,  cps=cps,
-                       font_size=10, font_name="Monaco")
+        if self._dismiss_pending:
+            # Center across full banner width (buttons still drawn separately)
+            ms.drawInRect_(NSMakeRect(pad, text_y, fw - 2 * pad, line_h))
+        else:
+            ms.drawInRect_(NSMakeRect(pad, text_y, text_right - pad, line_h))
 
-    @objc.python_method
-    def _draw_game_over(self):
-        from AppKit import (
-            NSColor, NSBezierPath, NSAttributedString, NSFont,
-            NSMutableParagraphStyle, NSForegroundColorAttributeName,
-            NSFontAttributeName, NSParagraphStyleAttributeName,
-            NSCenterTextAlignment,
-        )
-        from Foundation import NSMakeRect
-
-        fw, fh = self.frame().size.width, self.frame().size.height
-        pad = 24.0
-
-        # Full dark background
-        NSColor.colorWithRed_green_blue_alpha_(0.03, 0.0, 0.0, 0.97).set()
-        NSBezierPath.fillRect_(NSMakeRect(0, 0, fw, fh))
-
-        # Thick red border
-        r, g, b = _hex_to_rgb(self._cfg.get("color", "#FF0000")) if self._cfg else (1, 0, 0)
-        NSColor.colorWithRed_green_blue_alpha_(r, g, b, 1.0).set()
-        border = NSBezierPath.bezierPathWithRect_(NSMakeRect(0, 0, fw, fh))
-        border.setLineWidth_(4.0)
-        border.stroke()
-
-        cps = NSMutableParagraphStyle.new(); cps.setAlignment_(NSCenterTextAlignment)
-
-        # "GAME OVER" — huge
-        NSAttributedString.alloc().initWithString_attributes_("GAME OVER", {
-            NSFontAttributeName: NSFont.boldSystemFontOfSize_(72),
-            NSForegroundColorAttributeName: NSColor.colorWithRed_green_blue_alpha_(r, g, b, 1.0),
-            NSParagraphStyleAttributeName: cps,
-        }).drawInRect_(NSMakeRect(0, fh * 0.52, fw, 88))
-
-        # Event name
-        NSAttributedString.alloc().initWithString_attributes_(self._label, {
-            NSFontAttributeName: NSFont.boldSystemFontOfSize_(26),
-            NSForegroundColorAttributeName: NSColor.colorWithWhite_alpha_(0.85, 1.0),
-            NSParagraphStyleAttributeName: cps,
-        }).drawInRect_(NSMakeRect(pad, fh * 0.34, fw - 2*pad, 34))
-
-        # Countdown
-        NSAttributedString.alloc().initWithString_attributes_(self._countdown(), {
-            NSFontAttributeName: NSFont.systemFontOfSize_(18),
-            NSForegroundColorAttributeName: NSColor.colorWithWhite_alpha_(0.55, 1.0),
-            NSParagraphStyleAttributeName: cps,
-        }).drawInRect_(NSMakeRect(0, fh * 0.23, fw, 24))
-
-        # Buttons side by side centered
-        btn_w, btn_h = 120.0, 40.0
-        btn_gap = 16.0
-        total_w = btn_w * 2 + btn_gap
-        bx = (fw - total_w) / 2
-        by = fh * 0.08
-        self._snooze_rect  = (bx,              by, btn_w, btn_h)
-        self._dismiss_rect = (bx + btn_w + btn_gap, by, btn_w, btn_h)
-        self._draw_btn("Snooze",  self._snooze_rect,  primary=False, cps=cps, font_size=14)
-        self._draw_btn("Dismiss", self._dismiss_rect, primary=True,  cps=cps, font_size=14)
+        btn_font_size = 14.0
+        if single_btn:
+            label = "OMW" if self._game_over else "OK"
+            self._draw_btn(label, self._dismiss_rect, primary=True, dim=False, cps=cps,
+                           font_size=btn_font_size, font_name="Monaco")
+        else:
+            dismiss_primary = self._dismiss_pending
+            self._draw_btn("DISMISS", self._dismiss_rect, primary=dismiss_primary, dim=False, cps=cps,
+                           font_size=btn_font_size, font_name="Monaco")
+            self._draw_btn("SNOOZE",  self._snooze_rect,  primary=not dismiss_primary, dim=self._dismiss_pending, cps=cps,
+                           font_size=btn_font_size, font_name="Monaco")
 
     @objc.python_method
-    def _draw_btn(self, title, btn_rect, primary, cps, font_size=13, font_name=None):
+    def _draw_btn(self, title, btn_rect, primary, cps, font_size=14, font_name=None, dim=False):
         from AppKit import (
             NSColor, NSBezierPath, NSAttributedString, NSFont,
             NSForegroundColorAttributeName, NSFontAttributeName,
-            NSParagraphStyleAttributeName,
+            NSParagraphStyleAttributeName, NSKernAttributeName,
         )
         from Foundation import NSMakeRect
 
         bx, by, bw, bh = btn_rect
-        if primary:
-            r, g, b = _hex_to_rgb(self._cfg.get("color", "#FF8C00")) if self._cfg else (1, 0, 0)
-            NSColor.colorWithRed_green_blue_alpha_(r, g, b, 0.35).set()
-        else:
-            NSColor.colorWithWhite_alpha_(1.0, 0.12).set()
+        r_c, g_c, b_c = _hex_to_rgb(self._cfg.get("color", "#FF8C00")) if self._cfg else (1, 0, 0)
+        r_c, g_c, b_c = _popup_accent_rgb(r_c, g_c, b_c)
 
-        NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
-            NSMakeRect(bx, by, bw, bh), 6, 6).fill()
+        if dim:
+            # Deprioritized: very faint background, barely-visible border
+            NSColor.colorWithWhite_alpha_(1.0, 0.03).set()
+            NSBezierPath.fillRect_(NSMakeRect(bx, by, bw, bh))
+            NSColor.colorWithWhite_alpha_(1.0, 0.10).set()
+        elif primary:
+            NSColor.colorWithRed_green_blue_alpha_(r_c, g_c, b_c, 0.35).set()
+            NSBezierPath.fillRect_(NSMakeRect(bx, by, bw, bh))
+            NSColor.colorWithRed_green_blue_alpha_(r_c, g_c, b_c, 0.7).set()
+        else:
+            NSColor.colorWithWhite_alpha_(1.0, 0.10).set()
+            NSBezierPath.fillRect_(NSMakeRect(bx, by, bw, bh))
+            NSColor.colorWithWhite_alpha_(1.0, 0.25).set()
+
+        btn_border = NSBezierPath.bezierPathWithRect_(NSMakeRect(bx, by, bw, bh))
+        btn_border.setLineWidth_(1.0)
+        btn_border.stroke()
 
         if font_name:
             font = NSFont.fontWithName_size_(font_name, font_size) or NSFont.systemFontOfSize_(font_size)
         else:
             font = NSFont.systemFontOfSize_(font_size)
 
+        text_alpha = 0.25 if dim else 0.95
+        line_h = font_size + 2
         NSAttributedString.alloc().initWithString_attributes_(title, {
-            NSFontAttributeName: font,
-            NSForegroundColorAttributeName: NSColor.colorWithWhite_alpha_(0.92, 1.0),
-            NSParagraphStyleAttributeName: cps,
-        }).drawInRect_(NSMakeRect(bx + 2, by + (bh - font_size) / 2 - 1, bw - 4, font_size + 4))
+            NSFontAttributeName:            font,
+            NSForegroundColorAttributeName: NSColor.colorWithWhite_alpha_(text_alpha, 1.0),
+            NSParagraphStyleAttributeName:  cps,
+            NSKernAttributeName:            1.5,
+        }).drawInRect_(NSMakeRect(bx + 2, by + (bh - line_h) / 2.0 + 1, bw - 4, line_h))
 
     def mouseDown_(self, event):
         pass  # accept so mouseUp_ fires
@@ -859,9 +942,26 @@ class _BannerView(NSView):
             return bx <= lx <= bx + bw and by <= ly <= by + bh
 
         if _hit(self._dismiss_rect) and self._dismiss_cb:
-            self._dismiss_cb()
+            if self._game_over or self._at_start:
+                # Single click dismisses (OK button)
+                self._dismiss_cb()
+            elif self._dismiss_pending:
+                # Second click confirms dismiss
+                self._dismiss_cb()
+            else:
+                # First click: show confirm text
+                self._dismiss_pending = True
+                self.setNeedsDisplay_(True)
         elif _hit(self._snooze_rect) and self._snooze_cb:
+            self._dismiss_pending = False
             self._snooze_cb()
+        elif self._game_over and self._dismiss_cb:
+            # Any click anywhere on the game_over banner also dismisses
+            self._dismiss_cb()
+        elif self._dismiss_pending:
+            # Click elsewhere cancels pending dismiss
+            self._dismiss_pending = False
+            self.setNeedsDisplay_(True)
 
     def acceptsFirstMouse_(self, event):
         return True
@@ -892,7 +992,11 @@ class OverlayController:
         self._all_alerts: list = []   # sorted minutes_before descending
         self._dismiss_cb  = None
         self._tick_target = None
-        self._popup_pos   = "center"  # "center" | "top" | "snake"
+        self._popup_pos       = "center"
+        self._snake_coverage  = 0.0
+        self._last_tick_t     = 0.0
+        self._auto_dismiss_after = None
+        self._auto_dismiss_fn    = None   # callable used by tick(); None → self.dismiss
 
     @property
     def is_active(self) -> bool:
@@ -909,17 +1013,64 @@ class OverlayController:
         self._all_alerts  = all_alerts  # [5min, 2min, 0min]
         self._dismiss_cb  = dismiss_cb
         self._tick_target = tick_target
-        self._start_time  = time.time()
+        self._start_time     = time.time()
+        self._snake_coverage = 0.0
+        self._last_tick_t    = time.time()
+
+        # Auto-dismiss: game_over always; "none" popup_pos always
+        effect    = alert_cfg.get("effect", "normal")
+        popup_lvl = alert_cfg.get("popup_pos", "center")
+        if effect == "game_over" or popup_lvl == "none":
+            self._auto_dismiss_after = 120.0
+        else:
+            self._auto_dismiss_after = None
 
         from AppKit import NSScreen
         frame = NSScreen.mainScreen().frame()
         self._make_border(frame, alert_cfg)
         self._make_banner(frame, label, start_dt, alert_cfg)
 
+        # When there's no popup, clicks on the border overlay act as snooze (if a
+        # more-urgent level follows) or summon the banner (if already at max urgency).
+        if popup_lvl == "none" and self._border_win and self._border_view:
+            self._border_win.setIgnoresMouseEvents_(False)
+            if self._has_higher_alert():
+                self._border_view._click_cb = self._close_no_suppress
+                self._auto_dismiss_fn = self._close_no_suppress
+            else:
+                self._border_view._click_cb = self._show_banner_on_click
+                self._auto_dismiss_fn = self.dismiss
+
         from Foundation import NSTimer
         self._timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
             1 / 30.0, tick_target, "overlayTick:", None, True
         )
+
+    def _has_higher_alert(self) -> bool:
+        """True if there is a more-urgent (lower minutes_before) active level after the current one."""
+        active = [a for a in self._all_alerts if a.get("effect") != "none"]
+        try:
+            idx = next(i for i, a in enumerate(active)
+                       if a["minutes_before"] == self._current_cfg["minutes_before"])
+            return idx + 1 < len(active)
+        except StopIteration:
+            return False
+
+    def _show_banner_on_click(self) -> None:
+        """Called when the border is clicked at the most-urgent no-popup level.
+        Makes the border click-through again and shows the dismiss banner."""
+        if self._banner_win:
+            return  # banner already visible
+        # Stop catching border clicks now that the banner is about to appear
+        if self._border_win:
+            self._border_win.setIgnoresMouseEvents_(True)
+        if self._border_view:
+            self._border_view._click_cb = None
+        from AppKit import NSScreen
+        frame = NSScreen.mainScreen().frame()
+        # Force center popup regardless of config (we're summoning it on demand)
+        forced_cfg = {**self._current_cfg, "popup_pos": "center"}
+        self._make_banner(frame, self._label, self._start_dt, forced_cfg)
 
     def snooze(self) -> None:
         """Advance to the next more-urgent alert level. Dismiss if already at max."""
@@ -941,6 +1092,11 @@ class OverlayController:
         else:
             # Already at most urgent level — snooze = dismiss
             self.dismiss()
+
+    def _close_no_suppress(self) -> None:
+        """Tear down the current overlay without calling dismiss_cb.
+        The scheduler will fire the next level naturally when its time comes."""
+        self._teardown()
 
     def dismiss(self) -> None:
         cb = self._dismiss_cb
@@ -998,25 +1154,32 @@ class OverlayController:
         from Foundation import NSMakeRect
 
         global_cfg  = load_config()
-        popup_font  = global_cfg.get("popup_font", "modern")
-        popup_pos   = global_cfg.get("popup_pos",  "center")
-        game_over   = cfg.get("game_over", False)
+        popup_font  = global_cfg.get("popup_font", "retro")
+        game_over   = cfg.get("effect", "normal") == "game_over"
+
+        # Per-level popup_pos; fall back to global setting
+        popup_pos = cfg.get("popup_pos") or global_cfg.get("popup_pos", "center")
+        # Expand (walls closing in) always uses center — other positions fight the animation
+        if cfg.get("effect") == "expand":
+            popup_pos = "center"
         self._popup_pos = popup_pos
+
+        # "none" → no banner (auto-dismiss handled by tick)
+        if popup_pos == "none":
+            return
 
         sw, sh = screen_frame.size.width, screen_frame.size.height
 
-        if game_over:
-            bw = min(sw * 0.72, 860.0)
-            bh = 240.0
-        else:
-            bw = min(sw * 0.52, 680.0)
-            bh = 120.0
+        bw = min(sw * 0.65, 860.0)
+        bh = 96.0
 
+        bx = (sw - bw) / 2
         if popup_pos == "top":
-            bx = (sw - bw) / 2
             by = sh - bh - 60
-        else:  # center or snake (snake starts centered, moves in tick)
-            bx = (sw - bw) / 2
+        elif popup_pos == "top-right":
+            bx = sw - bw - 20
+            by = sh - bh - 60
+        else:  # center
             by = (sh - bh) / 2
 
         style = NSBorderlessWindowMask | 128  # NSNonactivatingPanelMask
@@ -1047,44 +1210,45 @@ class OverlayController:
         if not self._border_win or not self._current_cfg:
             return
 
-        cfg = self._current_cfg
-        t   = time.time()
+        cfg    = self._current_cfg
+        t      = time.time()
+        dt     = max(0.0, min(t - self._last_tick_t, 0.1)) if self._last_tick_t > 0 else 0.0
+        self._last_tick_t = t
+
+        # Auto-dismiss check
+        if self._auto_dismiss_after is not None:
+            if t - self._start_time >= self._auto_dismiss_after:
+                (self._auto_dismiss_fn or self.dismiss)()
+                return
+
+        effect   = cfg.get("effect", "normal")
         blink_hz = cfg.get("blink_hz", 0)
-        # Snake mode is always fully opaque — blink doesn't apply
-        is_snake = cfg.get("snake_mode", False)
+        # Snake and Game Over are always fully opaque — blink doesn't apply
         alpha = (
             0.4 + 0.6 * abs(math.sin(math.pi * blink_hz * t))
-            if blink_hz > 0 and not is_snake else 1.0
+            if blink_hz > 0 and effect not in ("snake", "game_over") else 1.0
         )
         self._border_win.setAlphaValue_(alpha)
 
-        if cfg.get("snake_mode", False):
+        if effect == "snake":
             fw = self._border_view.frame().size.width
             fh = self._border_view.frame().size.height
             w  = cfg.get("width", 40)
             perimeter = 2 * (fw - w) + 2 * (fh - w)
-            if perimeter > 0:
-                elapsed    = t - self._start_time
-                start_frac = cfg.get("snake_start", 0.0)
-                speed_frac = cfg.get("snake_speed", 80) / perimeter
-                self._border_view.set_snake_coverage(start_frac + elapsed * speed_frac)
+            if perimeter > 0 and w > 0:
+                gap        = 2.0
+                ring_pitch = w + gap
+                speed = cfg.get("snake_speed", 300)
+                self._snake_coverage += dt * speed / perimeter
+                # Cap at screen fill — never reset
+                max_loops = max(1, int((min(fw, fh) / 2 - w / 2) / ring_pitch))
+                if self._snake_coverage > max_loops:
+                    self._snake_coverage = float(max_loops)
+                self._border_view.set_snake_coverage(self._snake_coverage)
 
-            # Snake head: move banner to follow the snake tip
-            if (self._popup_pos == "snake" and self._banner_win and
-                    self._border_view and self._border_win):
-                hx, hy = self._border_view.snake_head_position()
-                sf  = self._border_win.frame()
-                bsz = self._banner_win.frame().size
-                bw, bh = bsz.width, bsz.height
-                ox, oy = sf.origin.x, sf.origin.y
-                sw, sh = sf.size.width, sf.size.height
-                nx = max(ox, min(ox + hx - bw / 2, ox + sw - bw))
-                ny = max(oy, min(oy + hy - bh / 2, oy + sh - bh))
-                self._banner_win.setFrameOrigin_((nx, ny))
-
-        elif cfg.get("expand"):
+        elif effect == "expand":
             elapsed = t - self._start_time
-            self._border_view.set_extra_width(elapsed * 4.0)  # 4 px/sec
+            self._border_view.set_extra_width(elapsed * 24.0)  # 24 px/sec
 
         if self._banner_view:
             self._banner_view.setNeedsDisplay_(True)
@@ -1162,15 +1326,15 @@ class _AppDelegate(NSObject):
 
         menu.addItem_(NSMenuItem.separatorItem())
 
-        for title, action in [
-            ("Set Hardstop…", "setHardstop:"),
-            ("Edit Config…",  "editConfig:"),
-        ]:
-            mi = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, action, "")
-            mi.setTarget_(self)
-            menu.addItem_(mi)
+        mi = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("Set Hardstop…", "setHardstop:", "")
+        mi.setTarget_(self)
+        menu.addItem_(mi)
 
         menu.addItem_(NSMenuItem.separatorItem())
+
+        mi = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("Edit Config…", "editConfig:", "")
+        mi.setTarget_(self)
+        menu.addItem_(mi)
 
         self._auth_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
             self._auth_label(), "authorizeCalendar:", ""
@@ -1289,26 +1453,27 @@ class _AppDelegate(NSObject):
         from Foundation import NSMakeRect
 
         alert = NSAlert.new()
-        alert.setMessageText_("Set Hardstop")
-        alert.setInformativeText_("Name your hardstop and enter a time or duration.")
+        alert.setMessageText_("Hardstop")
+        alert.setIcon_(_make_octagon_icon_colored())
         alert.addButtonWithTitle_("Set")
         alert.addButtonWithTitle_("Cancel")
 
         container = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, 300, 58))
 
-        name_field = NSTextField.alloc().initWithFrame_(NSMakeRect(0, 32, 300, 24))
-        name_field.setPlaceholderString_("Name  (e.g. Catch Bus, End of Day…)")
+        time_field = NSTextField.alloc().initWithFrame_(NSMakeRect(0, 32, 300, 24))
+        time_field.setPlaceholderString_("When  —  4:55pm  ·  30m  ·  5min  ·  1h30m")
 
-        time_field = NSTextField.alloc().initWithFrame_(NSMakeRect(0, 0, 300, 24))
-        time_field.setPlaceholderString_("Time: 4:55pm  or  Duration: 30m, 1h30m")
+        name_field = NSTextField.alloc().initWithFrame_(NSMakeRect(0, 0, 300, 24))
+        name_field.setPlaceholderString_("Name  (optional)")
 
-        container.addSubview_(name_field)
         container.addSubview_(time_field)
+        container.addSubview_(name_field)
         alert.setAccessoryView_(container)
-        alert.window().setInitialFirstResponder_(name_field)
+        alert.window().setInitialFirstResponder_(time_field)
 
         if alert.runModal() == 1000:  # NSAlertFirstButtonReturn
-            name = name_field.stringValue().strip() or "Hardstop"
+            default_name = self._config.get("default_name", "You have a hard stop!")
+            name = name_field.stringValue().strip() or default_name
             time_text = time_field.stringValue().strip().lower()
 
             # Test shortcuts: "test1" / "test2" / "test3" → fire that alert level now
@@ -1421,7 +1586,39 @@ def _run_config_server() -> None:
     def auth_status():
         with _calendar_lock:
             authorized = _calendar_service is not None
-        return jsonify({"authorized": authorized})
+        cfg = load_config()
+        oauth = cfg.get("oauth", {})
+        has_credentials = bool(
+            oauth.get("client_id", "").strip() and
+            oauth.get("client_secret", "").strip()
+        ) or CLIENT_SECRET_PATH.exists()
+        return jsonify({"authorized": authorized, "has_credentials": has_credentials})
+
+    @app.post("/api/save_oauth")
+    def save_oauth():
+        import yaml
+        data = request.get_json(force=True)
+        client_id     = data.get("client_id", "").strip()
+        client_secret = data.get("client_secret", "").strip()
+        if not client_id or not client_secret:
+            return jsonify({"ok": False, "error": "client_id and client_secret required"}), 400
+        try:
+            cfg = load_config()
+            cfg["oauth"] = {"client_id": client_id, "client_secret": client_secret}
+            APP_DIR.mkdir(parents=True, exist_ok=True)
+            CONFIG_PATH.write_text(
+                yaml.dump(cfg, default_flow_style=False, sort_keys=False)
+            )
+            return jsonify({"ok": True})
+        except Exception as e:
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.post("/api/open_url")
+    def open_url():
+        url = request.get_json(force=True).get("url", "")
+        if url.startswith("https://"):
+            subprocess.Popen(["open", url])
+        return jsonify({"ok": True})
 
     @app.post("/api/authorize")
     def do_authorize():
@@ -1463,10 +1660,9 @@ _CONFIG_HTML = r"""<!DOCTYPE html>
 :root{
   --bg:#0c0c0c;--card:#131010;--border:#2a1515;
   --accent:#cc2200;--accent-hi:#ff4422;--accent-dim:#3a0a00;
-  --text:#ddd0cf;--muted:#887070;--dim:#aa8888;--success:#44cc66;--cut:6px;
+  --text:#ddd0cf;--muted:#887070;--dim:#aa8888;--success:#44cc66;
 }
-.octo{clip-path:polygon(var(--cut) 0,calc(100% - var(--cut)) 0,100% var(--cut),100% calc(100% - var(--cut)),calc(100% - var(--cut)) 100%,var(--cut) 100%,0 calc(100% - var(--cut)),0 var(--cut));border-radius:0 !important}
-body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;font-size:13px;min-height:100vh}
+body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;font-size:14px;min-height:100vh}
 header{position:sticky;top:0;z-index:100;background:#0e0808;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:12px;padding:12px 20px}
 .logo-svg{flex-shrink:0}
 header h1{flex:1;font-size:14px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--text)}
@@ -1475,90 +1671,101 @@ header h1 span{color:var(--accent-hi)}
 #save-btn:hover{background:var(--accent-hi)}
 #save-btn:active{background:#991800}
 main{max-width:960px;margin:0 auto;padding:20px 16px 60px}
-.section-label{font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);margin-bottom:10px}
+.section-label{font-size:12px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);margin-bottom:10px}
 
 /* alerts grid */
 .alerts-grid{display:flex;flex-wrap:nowrap;gap:10px;overflow-x:auto;align-items:stretch;padding-bottom:4px;margin-bottom:18px;scrollbar-width:thin;scrollbar-color:var(--accent-dim) transparent}
 .alerts-grid::-webkit-scrollbar{height:4px}
 .alerts-grid::-webkit-scrollbar-thumb{background:var(--accent-dim)}
-.alert-card{flex:1 1 0;min-width:200px;background:var(--card);border:1px solid var(--border);overflow:hidden}
-.alerts-grid.carousel .alert-card{flex:0 0 270px}
+.alert-card{flex:1 1 0;min-width:220px;background:var(--card);border:1px solid var(--border);overflow:hidden;display:flex;flex-direction:column}
 .alert-card:hover{border-color:#3d2020}
-.add-card{flex:0 0 48px;background:none;border:1px dashed #441111;color:#663333;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:26px;font-weight:200;min-height:160px;transition:all .15s}
-.add-card:hover{border-color:var(--accent);color:var(--accent-hi);background:#110505}
 
 /* card parts */
-.card-header{display:flex;align-items:center;gap:8px;padding:9px 10px;background:#161010;border-bottom:1px solid var(--border)}
-.level-badge{background:var(--accent-dim);color:var(--accent-hi);font-size:9px;font-weight:800;letter-spacing:.1em;padding:2px 7px;text-transform:uppercase;flex-shrink:0}
-.mins-badge{flex:1;font-size:11px;color:var(--dim)}
-.remove-btn{background:none;border:1px solid #441111;color:#884444;width:20px;height:20px;cursor:pointer;font-size:11px;display:flex;align-items:center;justify-content:center;flex-shrink:0;transition:all .15s}
-.remove-btn:hover{background:#2a0808;border-color:var(--accent);color:var(--accent-hi)}
+.card-header{display:flex;align-items:center;gap:7px;padding:9px 10px;border-bottom:1px solid var(--border)}
+.level-badge{color:var(--accent-hi);font-size:11px;font-weight:800;letter-spacing:.1em;padding:2px 7px;text-transform:uppercase;flex-shrink:0}
+.f-mins-inline{background:#0a0505;border:1px solid var(--border);color:var(--text);padding:2px 4px;font-size:12px;text-align:center;outline:none;width:40px}
+.f-mins-inline:focus{border-color:var(--accent)}
+.f-mins-inline::-webkit-inner-spin-button,.f-mins-inline::-webkit-outer-spin-button{opacity:1;filter:invert(1) brightness(0.6)}
+.mins-label{font-size:12px;color:var(--muted);white-space:nowrap;flex:1}
 .preview-wrap{padding:8px 8px 0;background:#090505}
 .preview-canvas{display:block;width:100%;background:#060303}
-.mode-tabs{display:flex;gap:0;padding:8px 8px 0}
-.mode-tab{flex:1;background:var(--accent-dim);border:1px solid var(--border);color:var(--muted);padding:5px 0;font-size:11px;font-weight:700;letter-spacing:.05em;cursor:pointer;text-align:center;transition:all .15s;border-radius:0}
-.mode-tab:first-child{border-right:none}
-.mode-tab.active{background:var(--accent);color:#fff;border-color:var(--accent)}
-.mode-tab:hover:not(.active){background:#2a0e0e;color:var(--dim)}
-.card-fields{padding:10px 10px 12px;display:flex;flex-direction:column;gap:10px}
+.card-fields{flex:1;padding:10px 10px 12px;display:flex;flex-direction:column;gap:9px}
 .field-row{display:flex;flex-direction:column;gap:4px}
-.field-label{font-size:10px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;color:var(--muted)}
-input[type="number"]{background:#0a0505;border:1px solid var(--border);border-radius:0;color:var(--text);padding:5px 8px;font-size:13px;width:72px;outline:none}
-input[type="number"]:focus{border-color:var(--accent)}
-.color-row{display:flex;align-items:center;gap:7px}
-input[type="color"]{width:32px;height:26px;border:1px solid var(--border);border-radius:0;background:none;cursor:pointer;padding:2px;flex-shrink:0}
-.color-hex{background:#0a0505;border:1px solid var(--border);border-radius:0;color:var(--text);padding:4px 8px;font-size:12px;font-family:"SF Mono",Menlo,monospace;width:80px;outline:none}
-.color-hex:focus{border-color:var(--accent)}
-.slider-row{display:flex;align-items:center;gap:8px}
-input[type="range"]{-webkit-appearance:none;flex:1;height:3px;background:#2a1515;border-radius:0;outline:none;cursor:pointer}
-input[type="range"]::-webkit-slider-thumb{-webkit-appearance:none;width:12px;height:12px;background:var(--accent-hi);cursor:pointer;border:2px solid #0c0c0c;clip-path:polygon(50% 0%,100% 25%,100% 75%,50% 100%,0% 75%,0% 25%)}
-.sval{font-size:11px;font-family:"SF Mono",Menlo,monospace;color:var(--dim);min-width:52px;text-align:right}
-.toggle-row{display:flex;align-items:center;gap:8px}
-.toggle-label{flex:1;font-size:11px;color:var(--dim)}
-.toggle{position:relative;width:32px;height:18px;flex-shrink:0}
-.toggle input{opacity:0;width:0;height:0}
-.ttrack{position:absolute;inset:0;background:#331515;border:1px solid #441111;cursor:pointer;transition:all .2s;clip-path:polygon(3px 0,calc(100% - 3px) 0,100% 3px,100% calc(100% - 3px),calc(100% - 3px) 100%,3px 100%,0 calc(100% - 3px),0 3px)}
-.toggle input:checked + .ttrack{background:#882200;border-color:#aa3300}
-.ttrack::after{content:"";position:absolute;top:2px;left:2px;width:12px;height:12px;background:#776060;transition:all .2s;clip-path:polygon(2px 0,calc(100% - 2px) 0,100% 2px,100% calc(100% - 2px),calc(100% - 2px) 100%,2px 100%,0 calc(100% - 2px),0 2px)}
-.toggle input:checked + .ttrack::after{left:calc(100% - 14px);background:var(--accent-hi)}
-
-/* segmented controls */
-.seg-control{display:flex;gap:0;margin-top:4px}
-.seg-btn{flex:1;background:var(--accent-dim);border:1px solid var(--border);color:var(--muted);padding:5px 0;font-size:10px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;cursor:pointer;transition:all .15s;border-radius:0}
-.seg-btn:not(:first-child){border-left:none}
-.seg-btn.active{background:var(--accent);color:#fff;border-color:var(--accent)}
-.seg-btn:hover:not(.active){background:#2a0e0e;color:var(--dim)}
-
-/* width max */
-.f-width-max{background:none;border:1px solid #441111;color:#663333;padding:3px 7px;font-size:10px;font-weight:700;letter-spacing:.06em;cursor:pointer;flex-shrink:0;transition:all .15s}
-.f-width-max:hover,.f-width-max.active{border-color:var(--accent);color:var(--accent-hi);background:#1a0505}
-
-/* preview & action buttons */
-.preview-btn{width:100%;background:none;border:1px solid #441111;color:#884444;padding:7px 0;font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;cursor:pointer;transition:all .15s;margin-top:4px}
+.field-label{font-size:12px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;color:var(--muted)}
+select.f-effect{background:#0a0505;border:1px solid var(--border);color:var(--text);padding:5px 8px;font-size:12px;width:100%;outline:none;cursor:pointer}
+select.f-effect:focus{border-color:var(--accent)}
+select.f-effect option{background:#0c0c0c}
+.effect-note{font-size:10px;color:var(--muted);margin-top:-3px;line-height:1.4;display:none}
+.two-col-row{display:flex;gap:8px}
+.field-group{flex:1;display:flex;flex-direction:column;gap:4px}
+.disc-btns{display:flex;gap:0}
+.disc-btn{background:var(--accent-dim);border:1px solid var(--border);color:var(--muted);padding:5px 0;font-size:12px;font-weight:700;cursor:pointer;transition:all .15s;flex:1;text-align:center}
+.disc-btn:not(:first-child){border-left:none}
+.disc-btn.active{background:var(--accent);color:#fff;border-color:var(--accent)}
+.disc-btn:hover:not(.active){background:#2a0e0e;color:var(--dim)}
+.snake-fields{display:none}
+.preview-btn{width:100%;background:none;border:1px solid #441111;color:#884444;padding:7px 0;font-size:12px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;cursor:pointer;transition:all .15s;margin-top:auto}
 .preview-btn:hover{border-color:var(--accent);color:var(--accent-hi);background:#110505}
 
-/* popup & calendar settings panels */
+/* disabled level (effect=none) */
+.alert-card.level-disabled .card-fields>*:not(:first-child){opacity:.3;pointer-events:none}
+/* popup locked (effect=expand: center only) */
+.alert-card.popup-locked .f-popup-btn:not([data-val="center"]){opacity:.25;pointer-events:none}
+
+/* themes */
+.themes-list{display:flex;flex-direction:column;gap:3px}
+.theme-row{display:flex;align-items:center;gap:10px;padding:6px 8px;border:1px solid transparent;cursor:pointer;transition:border-color .15s;user-select:none}
+.theme-row:not(.theme-row-custom):hover{border-color:var(--accent)}
+.theme-row.theme-row-custom{cursor:default}
+.theme-swatches{display:flex;gap:5px;flex-shrink:0}
+.theme-swatch{width:30px;height:30px;border:1px solid rgba(255,255,255,.12);position:relative;flex-shrink:0}
+.theme-swatch.black-swatch::after{content:"";position:absolute;bottom:3px;right:3px;width:6px;height:6px;border-radius:50%;background:#FF0000}
+.theme-swatch.custom-swatch{cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:14px;color:rgba(255,255,255,.4)}
+.theme-swatch.custom-swatch:hover{border-color:var(--accent);color:rgba(255,255,255,.8)}
+.theme-label{font-size:12px;color:var(--muted);flex:1;letter-spacing:.04em}
+/* color picker popup */
+.cp-popup{position:fixed;z-index:9999;background:#140808;border:1px solid var(--accent);padding:10px;min-width:160px;display:none}
+.cp-popup.open{display:block}
+.cp-presets{display:grid;grid-template-columns:repeat(5,1fr);gap:4px;margin-bottom:8px}
+.cp-preset{width:24px;height:24px;border:1px solid transparent;cursor:pointer}
+.cp-preset:hover{border-color:#fff;transform:scale(1.1)}
+.cp-hex-row{display:flex;align-items:center;gap:5px}
+.cp-hash{color:var(--muted);font-size:13px;font-weight:700}
+.cp-hex-input{background:#080303;border:1px solid var(--border);color:var(--text);padding:4px 6px;font-size:12px;font-family:"SF Mono",Menlo,monospace;width:72px;outline:none;letter-spacing:.08em}
+.cp-hex-input:focus{border-color:var(--accent)}
+.cp-swatch-preview{width:24px;height:24px;border:1px solid rgba(255,255,255,.2);flex-shrink:0}
 .panel-wrap{background:var(--card);border:1px solid var(--border);margin-bottom:18px;overflow:hidden}
-.panel-wrap summary{list-style:none;padding:10px 14px;cursor:pointer;font-size:11px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);user-select:none;display:flex;align-items:center;gap:8px}
+.panel-wrap summary{list-style:none;padding:10px 14px;cursor:pointer;font-size:12px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);user-select:none;display:flex;align-items:center;gap:8px}
 .panel-wrap summary::before{content:"▸";font-size:10px;color:var(--accent);transition:transform .2s}
 .panel-wrap[open] summary::before{transform:rotate(90deg)}
 .panel-wrap summary::-webkit-details-marker{display:none}
 .panel-inner{padding:10px 14px 14px;display:flex;flex-direction:column;gap:12px}
 .panel-row{display:flex;align-items:center;gap:12px}
-.panel-row-label{font-size:10px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);min-width:80px}
+.panel-row-label{font-size:12px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);min-width:80px}
 
-/* calendar specifics */
+/* calendar */
 .cal-auth-row{display:flex;align-items:center;gap:10px;padding-bottom:12px;border-bottom:1px solid var(--border)}
-.cal-auth-status{flex:1;font-size:12px;color:var(--muted)}
+.cal-auth-status{flex:1;font-size:13px;color:var(--muted)}
 .cal-auth-status.ok{color:var(--success)}
 .cal-auth-btn{background:var(--accent-dim);color:var(--dim);border:1px solid var(--border);padding:5px 12px;font-size:11px;font-weight:700;cursor:pointer;letter-spacing:.05em;transition:all .15s}
 .cal-auth-btn:hover{background:var(--accent);color:#fff;border-color:var(--accent)}
 #cals-input{width:100%;background:#090404;border:1px solid var(--border);color:var(--text);padding:7px 10px;font-size:12px;font-family:"SF Mono",Menlo,monospace;outline:none;resize:vertical;min-height:44px}
 #cals-input:focus{border-color:var(--accent)}
 .cals-hint{font-size:11px;color:var(--muted);margin-top:4px}
+.creds-section{display:flex;flex-direction:column;gap:8px;padding:10px 12px;background:#0a0808;border:1px solid var(--border)}
+.creds-section a{color:var(--accent);text-decoration:none}
+.creds-section a:hover{text-decoration:underline}
+.creds-row{display:flex;align-items:center;gap:10px}
+.creds-label{font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);min-width:90px;flex-shrink:0}
+.creds-input{flex:1;background:#090404;border:1px solid var(--border);color:var(--text);padding:5px 8px;font-size:12px;font-family:"SF Mono",Menlo,monospace;outline:none}
+.creds-input:focus{border-color:var(--accent)}
+.creds-hint{font-size:11px;color:var(--muted)}
+.creds-connect-row{display:flex;justify-content:flex-end;gap:8px;margin-top:2px}
+.creds-edit-link{font-size:11px;color:var(--muted);cursor:pointer;text-decoration:underline;align-self:center}
+.creds-edit-link:hover{color:var(--text)}
 
 /* toast */
-#toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%) translateY(16px);background:#1a2a1a;border:1px solid #335533;color:var(--success);padding:9px 18px;font-size:13px;font-weight:600;opacity:0;transition:opacity .2s,transform .2s;pointer-events:none;clip-path:polygon(5px 0,calc(100% - 5px) 0,100% 5px,100% calc(100% - 5px),calc(100% - 5px) 100%,5px 100%,0 calc(100% - 5px),0 5px)}
+#toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%) translateY(16px);background:#1a2a1a;border:1px solid #335533;color:var(--success);padding:9px 18px;font-size:13px;font-weight:600;opacity:0;transition:opacity .2s,transform .2s;pointer-events:none}
 #toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
 #toast.err{background:#2a1a1a;border-color:#553333;color:#ff6644}
 </style>
@@ -1570,40 +1777,56 @@ input[type="range"]::-webkit-slider-thumb{-webkit-appearance:none;width:12px;hei
     <polygon points="9,2 21,2 28,9 28,21 21,28 9,28 2,21 2,9" fill="#cc2200" stroke="#ff4422" stroke-width="1"/>
   </svg>
   <h1><span>Hardstop</span> Config</h1>
-  <button id="save-btn" class="octo">Save</button>
+  <button id="save-btn">Save</button>
 </header>
 
 <main>
-  <div class="section-label">Alert Levels — most to least urgent, left to right</div>
-  <div id="alerts-grid" class="alerts-grid"></div>
+  <details class="panel-wrap" id="alerts-panel" open>
+    <summary>Alert Levels</summary>
+    <div class="panel-inner" style="padding-top:8px">
+      <div id="alerts-grid" class="alerts-grid"></div>
+    </div>
+  </details>
 
-  <details class="panel-wrap octo" id="popup-panel">
-    <summary>Popup Settings</summary>
+  <details class="panel-wrap" id="customizations-panel" open>
+    <summary>Customizations</summary>
     <div class="panel-inner">
+      <div class="section-label" style="margin-bottom:6px">Themes</div>
+      <div class="themes-list" id="themes-list"></div>
       <div class="panel-row">
-        <div class="panel-row-label">Font Style</div>
-        <div class="seg-control" id="font-seg" style="flex:1">
-          <button class="seg-btn" data-font="modern">Modern</button>
-          <button class="seg-btn" data-font="retro">Retro</button>
-        </div>
-      </div>
-      <div class="panel-row">
-        <div class="panel-row-label">Position</div>
-        <div class="seg-control" id="pos-seg" style="flex:1">
-          <button class="seg-btn" data-pos="center">Center</button>
-          <button class="seg-btn" data-pos="top">Top</button>
-          <button class="seg-btn" data-pos="snake">Snake Head</button>
-        </div>
+        <div class="panel-row-label">Default name</div>
+        <input id="default-name-input" type="text" placeholder="You have a hard stop!"
+          style="flex:1;background:#090404;border:1px solid var(--border);color:var(--text);padding:5px 8px;font-size:12px;outline:none">
       </div>
     </div>
   </details>
 
-  <details class="panel-wrap octo">
+  <details class="panel-wrap">
     <summary>Google Calendar Settings</summary>
     <div class="panel-inner">
       <div class="cal-auth-row">
         <span class="cal-auth-status" id="cal-auth-status">Checking…</span>
-        <button class="cal-auth-btn octo" id="cal-auth-btn">Authorize</button>
+        <span id="cal-auth-actions" style="display:flex;gap:6px;align-items:center"></span>
+      </div>
+      <div id="cal-creds-section" style="display:none">
+        <div class="creds-section">
+          <div class="creds-hint">
+            Create a free <a href="#" id="gcal-link">Google Cloud project</a>, enable the Calendar API,
+            then create an OAuth 2.0 Client ID (type: <strong>Desktop app</strong>).
+            Paste the credentials below — no files to move.
+          </div>
+          <div class="creds-row">
+            <span class="creds-label">Client ID</span>
+            <input id="cal-client-id" class="creds-input" type="text" placeholder="…googleusercontent.com" autocomplete="off" spellcheck="false">
+          </div>
+          <div class="creds-row">
+            <span class="creds-label">Client Secret</span>
+            <input id="cal-client-secret" class="creds-input" type="password" placeholder="secret" autocomplete="off">
+          </div>
+          <div class="creds-connect-row">
+            <button class="cal-auth-btn" id="cal-connect-btn">Save &amp; Connect →</button>
+          </div>
+        </div>
       </div>
       <div>
         <div class="field-label" style="margin-bottom:6px">Calendar IDs</div>
@@ -1621,442 +1844,485 @@ input[type="range"]::-webkit-slider-thumb{-webkit-appearance:none;width:12px;hei
 const REF_W = 1920, REF_H = 1080;
 
 const DEFAULT_ALERT = {
-  minutes_before:5, color:"#FF8C00",
+  minutes_before:5, color:"#FFCC00",
   width:40, blink_hz:0.5,
-  expand:false, gradient:true,
-  snake_mode:false, snake_speed:80, snake_start:0.0,
-  game_over:false,
+  effect:"fade",
+  snake_speed:300, popup_pos:"center",
 };
 
-let state = { calendars:[], alerts:[], popup_font:"modern", popup_pos:"center" };
+// Preset themes: colors applied to alerts sorted highest→lowest minutes_before.
+// "black" levels store #000000; popup auto-switches to red accent when color is near-black.
+const THEME_PRESETS = [
+  { label:"Yellow / Orange / Red",  colors:["#FFCC00","#FF6600","#FF0000"] },
+  { label:"Yellow / Red / Red",     colors:["#FFCC00","#FF0000","#FF0000"] },
+  { label:"Yellow / Red / Black",   colors:["#FFCC00","#FF0000","#000000"] },
+  { label:"Yellow / Black / Black", colors:["#FFCC00","#000000","#000000"] },
+];
+
+const CP_PRESETS=["#FFCC00","#FF8800","#FF4400","#FF0000","#FF44BB","#AA22FF","#88DDFF","#44FF88","#CCFF44","#FFFFFF"];
+
+let state = { calendars:[], alerts:[], popup_font:"retro", popup_pos:"center", default_name:"You have a hard stop!" };
 let rafs = {};
+
+function nearestDisc(btns, val) {
+  let best=btns[0], bestDist=Infinity;
+  btns.forEach(b=>{const d=Math.abs(parseFloat(b.dataset.val)-val);if(d<bestDist){bestDist=d;best=b;}});
+  return best;
+}
 
 // ── Boot ──────────────────────────────────────────────────────────────────────
 async function boot() {
   try {
-    const r = await fetch("/api/config");
-    const cfg = await r.json();
-    state.calendars  = cfg.calendars  || [];
-    state.alerts     = cfg.alerts     || [];
-    state.popup_font = cfg.popup_font || "modern";
-    state.popup_pos  = cfg.popup_pos  || "center";
+    const cfg = await (await fetch("/api/config")).json();
+    state.calendars    = cfg.calendars    || [];
+    state.alerts       = cfg.alerts       || [];
+    state.popup_font   = cfg.popup_font   || "retro";
+    state.popup_pos    = cfg.popup_pos    || "center";
+    state.default_name = cfg.default_name || "You have a hard stop!";
+    state.alerts.forEach(a => {
+      if (!a.effect) {
+        if (a.game_over)    a.effect="game_over";
+        else if (a.snake_mode) a.effect="snake";
+        else if (a.expand)  a.effect="expand";
+        else if (a.gradient) a.effect="fade";
+        else a.effect="normal";
+      }
+      if (!a.popup_pos) a.popup_pos = state.popup_pos;
+    });
     document.getElementById("cals-input").value = state.calendars.join("\n");
-    initPopupControls();
+    document.getElementById("default-name-input").value = state.default_name;
     renderAlerts();
-  } catch(e) { toast("Failed to load config: " + e, true); }
+    initThemes();
+  } catch(e) { toast("Failed to load config: "+e, true); }
   checkAuthStatus();
 }
 
-// ── Popup settings ─────────────────────────────────────────────────────────────
-function initPopupControls() {
-  document.querySelectorAll("#font-seg .seg-btn").forEach(btn => {
-    btn.classList.toggle("active", btn.dataset.font === state.popup_font);
-    btn.addEventListener("click", () => {
-      document.querySelectorAll("#font-seg .seg-btn").forEach(b => b.classList.remove("active"));
-      btn.classList.add("active");
-      state.popup_font = btn.dataset.font;
-    });
-  });
-  document.querySelectorAll("#pos-seg .seg-btn").forEach(btn => {
-    btn.classList.toggle("active", btn.dataset.pos === state.popup_pos);
-    btn.addEventListener("click", () => {
-      document.querySelectorAll("#pos-seg .seg-btn").forEach(b => b.classList.remove("active"));
-      btn.classList.add("active");
-      state.popup_pos = btn.dataset.pos;
-    });
-  });
-}
+document.getElementById("default-name-input").addEventListener("input", e => {
+  state.default_name = e.target.value.trim() || "You have a hard stop!";
+});
 
 // ── Calendar auth ──────────────────────────────────────────────────────────────
+document.getElementById("gcal-link").addEventListener("click", e=>{
+  e.preventDefault();
+  fetch("/api/open_url",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({url:"https://console.cloud.google.com/apis/credentials"})});
+});
+
 async function checkAuthStatus() {
   try {
-    const r = await fetch("/api/auth_status");
-    const d = await r.json();
-    const el = document.getElementById("cal-auth-status");
-    const btn = document.getElementById("cal-auth-btn");
+    const d = await (await fetch("/api/auth_status")).json();
+    const el=document.getElementById("cal-auth-status");
+    const actions=document.getElementById("cal-auth-actions");
+    const credsSection=document.getElementById("cal-creds-section");
+    actions.innerHTML="";
+
     if (d.authorized) {
-      el.textContent = "✓ Google Calendar authorized";
-      el.className = "cal-auth-status ok";
-      btn.textContent = "Re-authorize";
+      el.textContent="✓ Google Calendar connected"; el.className="cal-auth-status ok";
+      const reauth=document.createElement("button"); reauth.className="cal-auth-btn"; reauth.textContent="Re-authorize";
+      reauth.addEventListener("click", triggerAuth);
+      const edit=document.createElement("span"); edit.className="creds-edit-link"; edit.textContent="edit credentials";
+      edit.addEventListener("click",()=>{ credsSection.style.display=credsSection.style.display==="none"?"block":"none"; });
+      actions.appendChild(reauth); actions.appendChild(edit);
+      credsSection.style.display="none";
+    } else if (d.has_credentials) {
+      el.textContent="Not connected — click to authorize"; el.className="cal-auth-status";
+      const btn=document.createElement("button"); btn.className="cal-auth-btn"; btn.textContent="Authorize Google Calendar";
+      btn.addEventListener("click", triggerAuth);
+      const edit=document.createElement("span"); edit.className="creds-edit-link"; edit.textContent="edit credentials";
+      edit.addEventListener("click",()=>{ credsSection.style.display=credsSection.style.display==="none"?"block":"none"; });
+      actions.appendChild(btn); actions.appendChild(edit);
+      credsSection.style.display="none";
     } else {
-      el.textContent = "Not authorized — calendar polling disabled";
-      el.className = "cal-auth-status";
-      btn.textContent = "Authorize Google Calendar";
+      el.textContent="Not connected"; el.className="cal-auth-status";
+      credsSection.style.display="block";
     }
   } catch(e) {}
 }
-document.getElementById("cal-auth-btn").addEventListener("click", async () => {
+
+async function triggerAuth() {
+  try { await fetch("/api/authorize",{method:"POST"}); toast("Browser will open for Google Calendar authorization"); setTimeout(checkAuthStatus,8000); }
+  catch(e) { toast("Authorization failed: "+e,true); }
+}
+
+document.getElementById("cal-connect-btn").addEventListener("click", async ()=>{
+  const cid=document.getElementById("cal-client-id").value.trim();
+  const csec=document.getElementById("cal-client-secret").value.trim();
+  if (!cid || !csec) { toast("Paste both Client ID and Client Secret",true); return; }
   try {
-    await fetch("/api/authorize", { method:"POST" });
+    const r=await fetch("/api/save_oauth",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({client_id:cid,client_secret:csec})});
+    if (!(await r.json()).ok) throw new Error();
+    await fetch("/api/authorize",{method:"POST"});
     toast("Browser will open for Google Calendar authorization");
-    setTimeout(checkAuthStatus, 8000);
-  } catch(e) { toast("Authorization failed: " + e, true); }
+    setTimeout(checkAuthStatus,8000);
+  } catch(e) { toast("Failed to save credentials",true); }
 });
+
+// ── Themes ────────────────────────────────────────────────────────────────────
+let _openPicker=null; // currently open color picker element
+
+function applyThemeColors(colors){
+  const sorted=[...state.alerts].map((a,i)=>({...a,_i:i})).sort((a,b)=>b.minutes_before-a.minutes_before);
+  sorted.forEach((a,pos)=>{ if(pos<colors.length) state.alerts[a._i].color=colors[pos]; });
+  renderAlerts();
+  renderThemes();
+}
+
+function sortedAlertColors(){
+  return [...state.alerts].map((a,i)=>({...a,_i:i}))
+    .sort((a,b)=>b.minutes_before-a.minutes_before)
+    .map(a=>a.color||"#FF0000");
+}
+
+function makeColorPicker(swatchEl, alertIdx){
+  // Picker is appended to body (position:fixed) so panel overflow:hidden can't clip it
+  const popup=document.createElement("div"); popup.className="cp-popup";
+  popup.style.position="fixed";
+  const presetsDiv=document.createElement("div"); presetsDiv.className="cp-presets";
+  CP_PRESETS.forEach(c=>{
+    const p=document.createElement("div"); p.className="cp-preset"; p.style.background=c;
+    p.addEventListener("mousedown",e=>{e.preventDefault(); e.stopPropagation(); applyCustomColor(alertIdx,c,swatchEl,hexInput,preview); });
+    presetsDiv.appendChild(p);
+  });
+  popup.appendChild(presetsDiv);
+  const hexRow=document.createElement("div"); hexRow.className="cp-hex-row";
+  const hash=document.createElement("span"); hash.className="cp-hash"; hash.textContent="#";
+  const hexInput=document.createElement("input"); hexInput.className="cp-hex-input"; hexInput.maxLength=6;
+  hexInput.value=(state.alerts[alertIdx].color||"#FF0000").replace("#","");
+  const preview=document.createElement("div"); preview.className="cp-swatch-preview";
+  preview.style.background=state.alerts[alertIdx].color||"#FF0000";
+  hexInput.addEventListener("input",()=>{
+    const v=hexInput.value.replace(/[^0-9a-fA-F]/g,""); hexInput.value=v;
+    if(v.length===6){ applyCustomColor(alertIdx,"#"+v,swatchEl,hexInput,preview); }
+  });
+  hexInput.addEventListener("click",e=>e.stopPropagation());
+  hexRow.appendChild(hash); hexRow.appendChild(hexInput); hexRow.appendChild(preview);
+  popup.appendChild(hexRow);
+  popup.addEventListener("mousedown",e=>e.stopPropagation());
+  document.body.appendChild(popup);
+  return popup;
+}
+
+function applyCustomColor(alertIdx, color, swatchEl, hexInput, preview){
+  state.alerts[alertIdx].color=color;
+  swatchEl.style.background=color;
+  hexInput.value=color.replace("#","");
+  preview.style.background=color;
+}
+
+function renderThemes(){
+  const list=document.getElementById("themes-list"); if(!list) return;
+  // Remove any previously body-attached pickers before re-rendering
+  document.querySelectorAll(".cp-popup").forEach(el=>el.remove());
+  if(_openPicker) _openPicker=null;
+  list.innerHTML="";
+  // Preset rows
+  THEME_PRESETS.forEach(theme=>{
+    const row=document.createElement("div"); row.className="theme-row";
+    const swatches=document.createElement("div"); swatches.className="theme-swatches";
+    theme.colors.forEach((c,i)=>{
+      const sq=document.createElement("div"); sq.className="theme-swatch";
+      const dispColor=(theme.display&&theme.display[i]!=null)?theme.display[i]:c;
+      sq.style.background=dispColor;
+      if(theme.display&&theme.display[i]!=null) sq.classList.add("black-swatch");
+      swatches.appendChild(sq);
+    });
+    const lbl=document.createElement("div"); lbl.className="theme-label"; lbl.textContent=theme.label;
+    row.appendChild(swatches); row.appendChild(lbl);
+    row.addEventListener("click",()=>applyThemeColors(theme.colors));
+    list.appendChild(row);
+  });
+  // Custom row
+  const customRow=document.createElement("div"); customRow.className="theme-row theme-row-custom";
+  const customSwatches=document.createElement("div"); customSwatches.className="theme-swatches";
+  const sorted=[...state.alerts].map((a,i)=>({...a,_i:i})).sort((a,b)=>b.minutes_before-a.minutes_before);
+  sorted.slice(0,3).forEach(a=>{
+    const sq=document.createElement("div"); sq.className="theme-swatch custom-swatch";
+    sq.style.background=a.color||"#FF0000"; sq.title="Click to set color";
+    sq.textContent="✎";
+    const picker=makeColorPicker(sq,a._i);
+    sq.addEventListener("click",e=>{
+      e.stopPropagation();
+      const isOpen=picker.classList.contains("open");
+      if(_openPicker&&_openPicker!==picker){ _openPicker.classList.remove("open"); }
+      if(!isOpen){
+        // Position fixed relative to swatch, flip above if near bottom of viewport
+        const r=sq.getBoundingClientRect();
+        picker.style.left=r.left+"px";
+        picker.style.top=(r.bottom+4)+"px";
+        picker.style.bottom="";
+        picker.classList.add("open");
+        // After it's visible, check if it overflows the bottom
+        requestAnimationFrame(()=>{
+          const pr=picker.getBoundingClientRect();
+          if(pr.bottom>window.innerHeight-8){
+            picker.style.top=""; picker.style.bottom=(window.innerHeight-r.top+4)+"px";
+          }
+        });
+        _openPicker=picker;
+      } else {
+        picker.classList.remove("open");
+        _openPicker=null;
+      }
+    });
+    customSwatches.appendChild(sq);
+  });
+  const customLbl=document.createElement("div"); customLbl.className="theme-label"; customLbl.textContent="Custom";
+  customRow.appendChild(customSwatches); customRow.appendChild(customLbl);
+  list.appendChild(customRow);
+}
+
+function initThemes(){
+  renderThemes();
+  // Close pickers when clicking outside
+  document.addEventListener("click",()=>{ if(_openPicker){ _openPicker.classList.remove("open"); _openPicker=null; } });
+}
 
 // ── Render alerts ─────────────────────────────────────────────────────────────
 function renderAlerts() {
-  Object.values(rafs).forEach(cancelAnimationFrame);
-  rafs = {};
-  const grid = document.getElementById("alerts-grid");
-  grid.innerHTML = "";
-  grid.classList.toggle("carousel", state.alerts.length > 3);
-
-  const order = [...state.alerts]
-    .map((a,i) => ({...a, _i:i}))
-    .sort((a,b) => b.minutes_before - a.minutes_before);
-
-  order.forEach((a, pos) => {
-    const card = buildCard(a, a._i, pos+1);
-    grid.appendChild(card);
-    initPreview(card.querySelector(".preview-canvas"), a._i);
-  });
-
-  const addCard = document.createElement("button");
-  addCard.className = "add-card";
-  addCard.title = "Add alert level";
-  addCard.textContent = "+";
-  addCard.addEventListener("click", () => {
-    state.alerts.push({...DEFAULT_ALERT, minutes_before:10});
-    renderAlerts();
-    grid.scrollTo({left:grid.scrollWidth, behavior:"smooth"});
-  });
-  grid.appendChild(addCard);
+  Object.values(rafs).forEach(cancelAnimationFrame); rafs={};
+  const grid=document.getElementById("alerts-grid"); grid.innerHTML="";
+  const order=[...state.alerts].map((a,i)=>({...a,_i:i})).sort((a,b)=>b.minutes_before-a.minutes_before);
+  order.forEach((a,pos)=>{ const card=buildCard(a,a._i,pos+1); grid.appendChild(card); initPreview(card.querySelector(".preview-canvas"),a._i); });
+  renderThemes(); // keep custom row swatches in sync
 }
 
 function buildCard(a, idx, levelNum) {
-  const card = document.createElement("div");
-  card.className = "alert-card";
-  card.dataset.idx = idx;
-  const minsLabel = a.minutes_before===0 ? "At meeting start"
-                  : a.minutes_before===1 ? "1 minute before"
-                  : `${a.minutes_before} minutes before`;
-  const isSnake = !!a.snake_mode;
-  // effect: none | fade | expand
-  const eff = a.expand ? "expand" : a.gradient ? "fade" : "none";
-
-  card.innerHTML = `
+  const card=document.createElement("div"); card.dataset.idx=idx;
+  const eff=a.effect||(a.game_over?"game_over":a.snake_mode?"snake":a.expand?"expand":a.gradient?"fade":"normal");
+  card.className="alert-card"+(eff==="none"?" level-disabled":"")+(eff==="expand"?" popup-locked":"");
+  const isSnake=eff==="snake", isGO=eff==="game_over";
+  card.innerHTML=`
 <div class="card-header">
-  <span class="level-badge octo">LVL ${levelNum}</span>
-  <span class="mins-badge f-mins-label">${minsLabel}</span>
-  <button class="remove-btn octo" title="Remove">✕</button>
+  <span class="level-badge">Level ${levelNum}</span>
+  <input class="f-mins-inline" type="number" value="${a.minutes_before}" min="0" max="120" step="1">
+  <span class="mins-label">min before</span>
 </div>
-<div class="preview-wrap">
-  <canvas class="preview-canvas" height="80"></canvas>
-</div>
-<div class="mode-tabs">
-  <button class="mode-tab octo ${isSnake?'':'active'}" data-mode="perimeter">Perimeter</button>
-  <button class="mode-tab octo ${isSnake?'active':''}" data-mode="snake">Snake</button>
-</div>
+<div class="preview-wrap"><canvas class="preview-canvas"></canvas></div>
 <div class="card-fields">
   <div class="field-row">
-    <div class="field-label">Minutes before</div>
-    <input class="f-mins" type="number" value="${a.minutes_before}" min="0" max="120" step="1">
+    <select class="f-effect">
+      <option value="none"      ${eff==="none"     ?"selected":""}>None — no animation</option>
+      <option value="normal"    ${eff==="normal"   ?"selected":""}>Normal — solid border, pulses</option>
+      <option value="fade"      ${eff==="fade"     ?"selected":""}>Fade — gradient edge</option>
+      <option value="expand"    ${eff==="expand"   ?"selected":""}>Expand — walls closing in</option>
+      <option value="snake"     ${eff==="snake"    ?"selected":""}>Snake — crawling spiral</option>
+      <option value="game_over" ${eff==="game_over"?"selected":""}>Game Over — full screen</option>
+    </select>
+    <div class="effect-note"${isGO?' style="display:block"':''}>Full screen takeover. Auto-dismisses after 2 min.</div>
+  </div>
+  <div class="two-col-row">
+    <div class="field-group">
+      <div class="field-label">Width</div>
+      <div class="disc-btns">
+        <button class="disc-btn f-width-btn" data-val="20">Thin</button>
+        <button class="disc-btn f-width-btn" data-val="60">Med</button>
+        <button class="disc-btn f-width-btn" data-val="140">Thick</button>
+      </div>
+    </div>
+    <div class="field-group">
+      <div class="field-label">Blink</div>
+      <div class="disc-btns">
+        <button class="disc-btn f-blink-btn" data-val="0">Off</button>
+        <button class="disc-btn f-blink-btn" data-val="0.5">Slow</button>
+        <button class="disc-btn f-blink-btn" data-val="4.0">Fast</button>
+      </div>
+    </div>
   </div>
   <div class="field-row">
-    <div class="field-label">Color</div>
-    <div class="color-row">
-      <input class="f-color" type="color" value="${a.color}">
-      <input class="f-hex color-hex" type="text" value="${a.color}" maxlength="7">
+    <div class="field-label">Popup</div>
+    <div class="disc-btns">
+      <button class="disc-btn f-popup-btn" data-val="none">None</button>
+      <button class="disc-btn f-popup-btn" data-val="center">Center</button>
+      <button class="disc-btn f-popup-btn" data-val="top">Top</button>
+      <button class="disc-btn f-popup-btn" data-val="top-right">↗ Right</button>
     </div>
   </div>
-  <div class="field-row">
-    <div class="field-label">Border width</div>
-    <div class="slider-row">
-      <input class="f-width" type="range" min="10" max="400" value="${Math.min(+a.width||40,400)}">
-      <span class="sval f-width-v">${+a.width>=1000?'Max':(+a.width||40)+'px'}</span>
-      <button class="f-width-max octo${+a.width>=1000?' active':''}" title="Fill screen">Max</button>
-    </div>
-  </div>
-  <!-- PERIMETER fields -->
-  <div class="perimeter-fields" style="${isSnake?'display:none':''}">
+  <div class="snake-fields"${isSnake?' style="display:block"':''}>
     <div class="field-row">
-      <div class="field-label">Blink rate</div>
-      <div class="slider-row">
-        <input class="f-blink" type="range" min="0" max="10" step="0.1" value="${a.blink_hz}">
-        <span class="sval f-blink-v">${(+a.blink_hz).toFixed(1)} Hz</span>
-      </div>
-    </div>
-    <div class="field-row">
-      <div class="field-label">Effect</div>
-      <div class="seg-control">
-        <button class="seg-btn${eff==='none'?' active':''}" data-effect="none">None</button>
-        <button class="seg-btn${eff==='fade'?' active':''}" data-effect="fade">Fade</button>
-        <button class="seg-btn${eff==='expand'?' active':''}" data-effect="expand">Expand</button>
+      <div class="field-label">Speed</div>
+      <div class="disc-btns">
+        <button class="disc-btn f-snake-btn" data-val="50">Slow</button>
+        <button class="disc-btn f-snake-btn" data-val="300">Med</button>
+        <button class="disc-btn f-snake-btn" data-val="600">Fast</button>
       </div>
     </div>
   </div>
-  <!-- SNAKE fields -->
-  <div class="snake-fields" style="${isSnake?'':'display:none'}">
-    <div class="field-row">
-      <div class="field-label">Speed (px/sec on 1080p)</div>
-      <div class="slider-row">
-        <input class="f-snake-speed" type="range" min="10" max="1200" value="${+(a.snake_speed)||80}">
-        <span class="sval f-snake-speed-v">${+(a.snake_speed)||80} px/s</span>
-      </div>
-    </div>
-    <div class="field-row">
-      <div class="field-label">Starting coverage</div>
-      <div class="slider-row">
-        <input class="f-snake-start" type="range" min="0" max="1" step="0.01" value="${+(a.snake_start)||0}">
-        <span class="sval f-snake-start-v">${Math.round((+(a.snake_start)||0)*100)}%</span>
-      </div>
-    </div>
-  </div>
-  <div class="field-row" style="margin-top:2px">
-    <div class="toggle-row">
-      <span class="toggle-label field-label">Game Over style</span>
-      <label class="toggle">
-        <input class="f-game-over" type="checkbox" ${a.game_over?'checked':''}>
-        <div class="ttrack"></div>
-      </label>
-    </div>
-  </div>
-  <button class="preview-btn octo" data-level="${levelNum}">▶ Preview</button>
+  <button class="preview-btn" data-level="${levelNum}" style="margin-top:auto">▶ PREVIEW</button>
 </div>`;
-
-  wireCard(card, idx);
-  return card;
+  wireCard(card,idx); return card;
 }
 
 function wireCard(card, idx) {
-  card.querySelector(".remove-btn").addEventListener("click", () => {
-    if (state.alerts.length <= 1) return;
-    state.alerts.splice(idx, 1);
-    renderAlerts();
-  });
-
-  card.querySelectorAll(".mode-tab").forEach(tab => {
-    tab.addEventListener("click", () => {
-      const isSnake = tab.dataset.mode === "snake";
-      state.alerts[idx].snake_mode = isSnake;
-      card.querySelectorAll(".mode-tab").forEach(t => t.classList.toggle("active", t===tab));
-      card.querySelector(".perimeter-fields").style.display = isSnake ? "none" : "";
-      card.querySelector(".snake-fields").style.display     = isSnake ? "" : "none";
-    });
-  });
-
-  const minsInput = card.querySelector(".f-mins");
-  minsInput.addEventListener("input", e => {
-    const v = parseInt(e.target.value)||0;
-    state.alerts[idx].minutes_before = v;
-    card.querySelector(".f-mins-label").textContent =
-      v===0 ? "At meeting start" : v===1 ? "1 minute before" : `${v} minutes before`;
-  });
-
-  const colorPicker = card.querySelector(".f-color");
-  const colorHex    = card.querySelector(".f-hex");
-  colorPicker.addEventListener("input", e => { state.alerts[idx].color = e.target.value; colorHex.value = e.target.value; });
-  colorHex.addEventListener("change", e => {
-    if (/^#[0-9a-fA-F]{6}$/.test(e.target.value)) {
-      state.alerts[idx].color = e.target.value;
-      colorPicker.value = e.target.value;
+  card.querySelector(".f-mins-inline").addEventListener("input",e=>{state.alerts[idx].minutes_before=parseInt(e.target.value)||0;});
+  const effectSel=card.querySelector(".f-effect"), snakeFields=card.querySelector(".snake-fields"), effectNote=card.querySelector(".effect-note");
+  const pBtns=[...card.querySelectorAll(".f-popup-btn")];
+  effectSel.addEventListener("change",()=>{
+    const eff=effectSel.value; state.alerts[idx].effect=eff;
+    snakeFields.style.display=eff==="snake"?"block":"none";
+    effectNote.style.display=eff==="game_over"?"block":"none";
+    card.classList.toggle("level-disabled", eff==="none");
+    card.classList.toggle("popup-locked",   eff==="expand");
+    if (eff==="expand") {
+      // Force popup to center
+      state.alerts[idx].popup_pos="center";
+      pBtns.forEach(b=>b.classList.remove("active"));
+      const cb=card.querySelector('.f-popup-btn[data-val="center"]');
+      if(cb) cb.classList.add("active");
     }
+    const cv=card.querySelector(".preview-canvas");
+    if(cv){cv._coverage=0;cv._expandExtra=0;cv._snakeT=undefined;cv._expandT=undefined;}
   });
-
-  const wSlider = card.querySelector(".f-width");
-  const wVal    = card.querySelector(".f-width-v");
-  const wMaxBtn = card.querySelector(".f-width-max");
-  wSlider.addEventListener("input", e => {
-    state.alerts[idx].width = +e.target.value;
-    wVal.textContent = `${state.alerts[idx].width}px`;
-    wMaxBtn.classList.remove("active");
-  });
-  wMaxBtn.addEventListener("click", () => {
-    const isMax = wMaxBtn.classList.toggle("active");
-    state.alerts[idx].width = isMax ? 2000 : +wSlider.value;
-    wVal.textContent = isMax ? "Max" : `${+wSlider.value}px`;
-  });
-
-  const bSlider = card.querySelector(".f-blink");
-  const bVal    = card.querySelector(".f-blink-v");
-  bSlider.addEventListener("input", e => {
-    state.alerts[idx].blink_hz = +e.target.value;
-    bVal.textContent = `${state.alerts[idx].blink_hz.toFixed(1)} Hz`;
-  });
-
-  card.querySelectorAll(".seg-btn").forEach(btn => {
-    btn.addEventListener("click", () => {
-      card.querySelectorAll(".seg-btn").forEach(b => b.classList.remove("active"));
-      btn.classList.add("active");
-      const eff = btn.dataset.effect;
-      state.alerts[idx].expand   = eff === "expand";
-      state.alerts[idx].gradient = eff === "fade";
-    });
-  });
-
-  const ssSlider = card.querySelector(".f-snake-speed");
-  const ssVal    = card.querySelector(".f-snake-speed-v");
-  ssSlider.addEventListener("input", e => {
-    state.alerts[idx].snake_speed = +e.target.value;
-    ssVal.textContent = `${state.alerts[idx].snake_speed} px/s`;
-    // Reset preview so speed change is immediately visible
-    const canvas = card.querySelector(".preview-canvas");
-    if (canvas) canvas._startTime = performance.now()/1000;
-  });
-
-  const stSlider = card.querySelector(".f-snake-start");
-  const stVal    = card.querySelector(".f-snake-start-v");
-  stSlider.addEventListener("input", e => {
-    state.alerts[idx].snake_start = +e.target.value;
-    stVal.textContent = `${Math.round(state.alerts[idx].snake_start*100)}%`;
-    const canvas = card.querySelector(".preview-canvas");
-    if (canvas) canvas._startTime = performance.now()/1000;
-  });
-
-  card.querySelector(".f-game-over").addEventListener("change", e => {
-    state.alerts[idx].game_over = e.target.checked;
-  });
-
-  card.querySelector(".preview-btn").addEventListener("click", async () => {
-    const n = +card.querySelector(".preview-btn").dataset.level;
-    try {
-      const r = await fetch(`/api/preview/${n}`);
-      const d = await r.json();
-      d.ok ? toast(`▶ Level ${n} preview fired`) : toast(d.error||"Preview failed", true);
-    } catch(e) { toast("Preview failed: "+e, true); }
+  const wBtns=[...card.querySelectorAll(".f-width-btn")];
+  nearestDisc(wBtns,+(state.alerts[idx].width)||40).classList.add("active");
+  wBtns.forEach(btn=>btn.addEventListener("click",()=>{wBtns.forEach(b=>b.classList.remove("active"));btn.classList.add("active");state.alerts[idx].width=parseInt(btn.dataset.val);}));
+  const bBtns=[...card.querySelectorAll(".f-blink-btn")];
+  nearestDisc(bBtns,+(state.alerts[idx].blink_hz)||0).classList.add("active");
+  bBtns.forEach(btn=>btn.addEventListener("click",()=>{bBtns.forEach(b=>b.classList.remove("active"));btn.classList.add("active");state.alerts[idx].blink_hz=parseFloat(btn.dataset.val);}));
+  const curPopup=state.alerts[idx].popup_pos||"center";
+  (card.querySelector(`.f-popup-btn[data-val="${curPopup}"]`)||pBtns[1]).classList.add("active");
+  pBtns.forEach(btn=>btn.addEventListener("click",()=>{pBtns.forEach(b=>b.classList.remove("active"));btn.classList.add("active");state.alerts[idx].popup_pos=btn.dataset.val;}));
+  const sBtns=[...card.querySelectorAll(".f-snake-btn")];
+  nearestDisc(sBtns,+(state.alerts[idx].snake_speed)||300).classList.add("active");
+  sBtns.forEach(btn=>btn.addEventListener("click",()=>{sBtns.forEach(b=>b.classList.remove("active"));btn.classList.add("active");state.alerts[idx].snake_speed=parseInt(btn.dataset.val);}));
+  card.querySelector(".preview-btn").addEventListener("click",async()=>{
+    const n=+card.querySelector(".preview-btn").dataset.level;
+    await saveConfig(true);
+    try{const d=await(await fetch(`/api/preview/${n}`)).json();d.ok?toast(`▶ Level ${n} preview`):toast(d.error||"Preview failed",true);}
+    catch(e){toast("Preview failed: "+e,true);}
   });
 }
 
 // ── Preview canvas ────────────────────────────────────────────────────────────
 function initPreview(canvas, idx) {
   if (!canvas) return;
-  const cw = canvas.parentElement.clientWidth - 16;
-  canvas.width  = Math.max(60, cw);
-  canvas.height = Math.round(canvas.width * REF_H / REF_W);
-  canvas._startTime = performance.now()/1000;
-  function frame(ts) {
-    drawPreview(canvas, state.alerts[idx], ts/1000);
-    rafs[idx] = requestAnimationFrame(frame);
-  }
-  rafs[idx] = requestAnimationFrame(frame);
+  const cw=canvas.parentElement.clientWidth-16;
+  canvas.width=Math.max(60,cw); canvas.height=Math.round(canvas.width*REF_H/REF_W);
+  canvas._coverage=0; canvas._snakeT=undefined; canvas._expandT=undefined; canvas._expandExtra=0;
+  function frame(ts){drawPreview(canvas,state.alerts[idx],ts/1000);rafs[idx]=requestAnimationFrame(frame);}
+  rafs[idx]=requestAnimationFrame(frame);
 }
 
-function hexToRgb(hex) {
-  const h = (hex||"#ff0000").replace("#","");
-  return [parseInt(h.slice(0,2),16), parseInt(h.slice(2,4),16), parseInt(h.slice(4,6),16)];
-}
+function hexToRgb(hex){const h=(hex||"#ff0000").replace("#","");return[parseInt(h.slice(0,2),16),parseInt(h.slice(2,4),16),parseInt(h.slice(4,6),16)];}
+// If color is near-black, return red for popup accents (matches Python _popup_accent_rgb)
+function accentRgb(r,g,b){return(r+g+b)<46?[255,0,0]:[r,g,b];}
 
 function drawPreview(canvas, a, t) {
   if (!a) return;
-  const ctx = canvas.getContext("2d");
-  const W = canvas.width, H = canvas.height;
-  const scale = W / REF_W;
-  const elapsed = Math.max(0, t - (canvas._startTime || t));
-
-  // Base width (respect Max)
-  const baseW = +a.width >= 1000
-    ? Math.floor(W/2)
-    : Math.max(1, Math.round((+a.width||40) * scale));
-
-  let w = baseW;
-  if (!a.snake_mode && a.expand) {
-    // Width grows at 4px/sec (real pixels), scaled to canvas
-    const extra = Math.round(elapsed * 4.0 * scale);
-    w = Math.min(Math.floor(W/2), baseW + extra);
-    if (w >= Math.floor(W/2)) { canvas._startTime = t; w = baseW; } // loop
+  const ctx=canvas.getContext("2d"), W=canvas.width, H=canvas.height, scale=W/REF_W;
+  const effect=a.effect||(a.game_over?"game_over":a.snake_mode?"snake":a.expand?"expand":a.gradient?"fade":"normal");
+  const baseW=Math.max(1,Math.round((+a.width||40)*scale));
+  const [r,g,b]=hexToRgb(a.color);
+  ctx.clearRect(0,0,W,H); ctx.fillStyle="#060303"; ctx.fillRect(0,0,W,H);
+  if (effect==="none") return;
+  if (effect==="game_over") {
+    ctx.fillStyle=`rgb(${r},${g},${b})`; ctx.fillRect(0,0,W,H);
+    const popW=W*0.6,popH=H*0.2,popX=(W-W*0.6)/2,popY=(H-H*0.2)/2;
+    const[ar,ag,ab]=accentRgb(r,g,b);
+    ctx.fillStyle="rgba(5,2,2,0.92)"; ctx.fillRect(popX,popY,popW,popH);
+    ctx.strokeStyle=`rgba(${ar},${ag},${ab},0.8)`; ctx.lineWidth=Math.max(1,W*0.004); ctx.strokeRect(popX,popY,popW,popH);
+    return;
   }
-
-  ctx.clearRect(0,0,W,H);
-  ctx.fillStyle = "#060303";
-  ctx.fillRect(0,0,W,H);
-
-  const [r,g,b] = hexToRgb(a.color);
-  let alpha = 1.0;
-  if (!a.snake_mode && (+a.blink_hz||0) > 0) {
-    alpha = 0.4 + 0.6 * Math.abs(Math.sin(Math.PI * a.blink_hz * t));
-  }
-
-  if (a.snake_mode) {
-    drawSnake(ctx, W, H, w, r, g, b, a, t, canvas._startTime||t);
-  } else {
-    drawBorder(ctx, W, H, w, r, g, b, alpha, !!a.gradient || !!a.expand);
-  }
-}
-
-function drawBorder(ctx, W, H, w, r, g, b, alpha, gradient) {
-  const color = `rgba(${r},${g},${b},${alpha})`;
-  const clear  = `rgba(${r},${g},${b},0)`;
-  const strips = [
-    [0,   H-w, W, w,  0, H-w, 0, H],
-    [0,   0,   W, w,  0, w,   0, 0],
-    [0,   0,   w, H,  w, 0,   0, 0],
-    [W-w, 0,   w, H,  W-w,0, W, 0],
-  ];
-  for (const [x,y,sw,sh,x0,y0,x1,y1] of strips) {
-    if (gradient) {
-      const g2 = ctx.createLinearGradient(x0,y0,x1,y1);
-      g2.addColorStop(0, clear);
-      g2.addColorStop(1, color);
-      ctx.fillStyle = g2;
-    } else {
-      ctx.fillStyle = color;
+  if (effect==="snake") {
+    if (canvas._snakeT!==undefined) {
+      const dt=Math.min(t-canvas._snakeT,0.1);
+      const realP=2*(REF_W-(+a.width||40))+2*(REF_H-(+a.width||40));
+      canvas._coverage=(canvas._coverage||0)+dt*(+(a.snake_speed)||300)/realP;
+      const gap=2,rp=baseW+gap,maxL=Math.max(1,Math.floor((Math.min(W,H)/2-baseW/2)/rp));
+      if (canvas._coverage>maxL) canvas._coverage=maxL;
     }
-    ctx.fillRect(x,y,sw,sh);
+    canvas._snakeT=t; drawSnake(ctx,W,H,baseW,r,g,b,canvas._coverage||0); return;
   }
+  let w=baseW;
+  if (effect==="expand") {
+    if (canvas._expandT!==undefined) {
+      const dt=Math.min(t-canvas._expandT,0.1);
+      canvas._expandExtra=(canvas._expandExtra||0)+dt*24.0;
+      const maxExtra=Math.floor(W/2)-baseW;
+      if (canvas._expandExtra>=maxExtra) canvas._expandExtra=maxExtra;
+    }
+    canvas._expandT=t; w=Math.min(Math.floor(W/2),baseW+(canvas._expandExtra||0));
+  }
+  let alpha=1.0;
+  if ((+a.blink_hz||0)>0) alpha=0.4+0.6*Math.abs(Math.sin(Math.PI*a.blink_hz*t));
+  if (effect==="expand") drawBorderGradient(ctx,W,H,w,r,g,b,alpha);
+  else drawBorder(ctx,W,H,w,r,g,b,alpha);
 }
 
-function drawSnake(ctx, W, H, w, r, g, b, a, t, startTime) {
-  const hw = w/2;
-  const segs = [
-    [hw,   H-hw, W-hw, H-hw],
-    [W-hw, H-hw, W-hw, hw],
-    [W-hw, hw,   hw,   hw],
-    [hw,   hw,   hw,   H-hw],
-  ];
-  const segLens = segs.map(([sx,sy,ex,ey]) => Math.hypot(ex-sx,ey-sy));
-  const canvasPerimeter = segLens.reduce((a,b)=>a+b,0);
-  const realPerimeter = 2*(REF_W-(+a.width||40)) + 2*(REF_H-(+a.width||40));
-  const startFrac = +(a.snake_start)||0;
-  const speed     = +(a.snake_speed)||80;
-  const elapsed   = Math.max(0, t - startTime);
-  // Loop so speed changes are always visible in preview
-  const rawCov    = startFrac + elapsed * (speed / realPerimeter);
-  const coverage  = rawCov % 1.0;
-  const targetLen = coverage * canvasPerimeter;
-  if (targetLen <= 0) return;
-  ctx.strokeStyle = `rgb(${r},${g},${b})`;
-  ctx.lineWidth   = w;
-  ctx.lineCap     = "butt";
-  ctx.lineJoin    = "miter";
-  ctx.beginPath();
-  let rem = targetLen, first = true;
-  for (let i = 0; i < segs.length && rem > 0; i++) {
-    const [sx,sy,ex,ey] = segs[i];
-    if (first) { ctx.moveTo(sx,sy); first=false; }
-    if (rem >= segLens[i]) { ctx.lineTo(ex,ey); rem -= segLens[i]; }
-    else { const f=rem/segLens[i]; ctx.lineTo(sx+f*(ex-sx),sy+f*(ey-sy)); rem=0; }
+function drawBorder(ctx,W,H,w,r,g,b,alpha){
+  ctx.fillStyle=`rgba(${r},${g},${b},${alpha})`;
+  ctx.fillRect(0,0,W,w);
+  ctx.fillRect(0,H-w,W,w);
+  ctx.fillRect(0,0,w,H);
+  ctx.fillRect(W-w,0,w,H);
+}
+
+function drawBorderGradient(ctx,W,H,w,r,g,b,alpha){
+  const solid=`rgba(${r},${g},${b},${alpha})`,clear=`rgba(${r},${g},${b},0)`;
+  let g2;
+  // Top: solid at y=0, clear at y=w
+  g2=ctx.createLinearGradient(0,0,0,w); g2.addColorStop(0,solid); g2.addColorStop(1,clear);
+  ctx.fillStyle=g2; ctx.fillRect(0,0,W,w);
+  // Bottom: clear at y=H-w, solid at y=H
+  g2=ctx.createLinearGradient(0,H-w,0,H); g2.addColorStop(0,clear); g2.addColorStop(1,solid);
+  ctx.fillStyle=g2; ctx.fillRect(0,H-w,W,w);
+  // Left: solid at x=0, clear at x=w
+  g2=ctx.createLinearGradient(0,0,w,0); g2.addColorStop(0,solid); g2.addColorStop(1,clear);
+  ctx.fillStyle=g2; ctx.fillRect(0,0,w,H);
+  // Right: clear at x=W-w, solid at x=W
+  g2=ctx.createLinearGradient(W-w,0,W,0); g2.addColorStop(0,clear); g2.addColorStop(1,solid);
+  ctx.fillStyle=g2; ctx.fillRect(W-w,0,w,H);
+}
+
+function drawSnake(ctx,W,H,w,r,g,b,totalCoverage){
+  // Continuous spiral: one stroke path, every ring uses shortened top + vertical step inward.
+  // Canvas: y=0 at top; clockwise = right↓ bottom← left↑ top→ step↓.
+  const gap=2,ringPitch=w+gap,loopCount=Math.floor(totalCoverage||0),frac=(totalCoverage||0)-loopCount;
+  ctx.strokeStyle=`rgb(${r},${g},${b})`; ctx.lineWidth=w; ctx.lineJoin="miter"; ctx.lineCap="butt";
+  ctx.beginPath(); let started=false;
+  for(let ring=0;ring<=loopCount;ring++){
+    const inset=ring*ringPitch,hw=w/2+inset;
+    if(hw+w/2>=Math.min(W,H)/2) break;
+    const isPartial=(ring===loopCount);
+    const segs=[
+      [W-hw, hw,          W-hw,          H-hw       ],  // right ↓
+      [W-hw, H-hw,        hw,            H-hw       ],  // bottom ←
+      [hw,   H-hw,        hw,            hw         ],  // left ↑
+      [hw,   hw,          W-hw-ringPitch,hw         ],  // top → (shortened)
+      [W-hw-ringPitch,hw, W-hw-ringPitch,hw+ringPitch],  // step ↓ inward
+    ];
+    const segLens=segs.map(([sx,sy,ex,ey])=>Math.hypot(ex-sx,ey-sy));
+    const total=segLens.reduce((a,b)=>a+b,0);
+    const targetLen=isPartial?frac*total:total;
+    if(targetLen<=0) break;
+    let rem=targetLen;
+    for(let i=0;i<segs.length&&rem>0;i++){
+      const[sx,sy,ex,ey]=segs[i];
+      if(!started){ctx.moveTo(sx,sy);started=true;}
+      if(rem>=segLens[i]){ctx.lineTo(ex,ey);rem-=segLens[i];}
+      else{const f=rem/segLens[i];ctx.lineTo(sx+f*(ex-sx),sy+f*(ey-sy));rem=0;}
+    }
+    if(isPartial) break;
   }
-  ctx.stroke();
+  if(started) ctx.stroke();
 }
 
 // ── Save ──────────────────────────────────────────────────────────────────────
-document.getElementById("save-btn").addEventListener("click", async () => {
-  const raw = document.getElementById("cals-input").value.trim();
-  state.calendars = raw ? raw.split("\n").map(s=>s.trim()).filter(Boolean) : [];
-  try {
-    const r = await fetch("/api/config", {
-      method:"POST",
-      headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({
-        calendars: state.calendars,
-        alerts:    state.alerts,
-        popup_font: state.popup_font,
-        popup_pos:  state.popup_pos,
-      }),
-    });
-    const d = await r.json();
-    d.ok ? toast("✓ Saved — restart Hardstop to apply") : toast("Error: "+d.error, true);
-  } catch(e) { toast("Save failed: "+e, true); }
-});
+async function saveConfig(silent=false){
+  state.calendars=(document.getElementById("cals-input").value.trim()||"").split("\n").map(s=>s.trim()).filter(Boolean);
+  try{
+    const d=await(await fetch("/api/config",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({calendars:state.calendars,alerts:state.alerts,popup_font:state.popup_font,popup_pos:state.popup_pos,default_name:state.default_name})})).json();
+    if(!silent) d.ok?toast("✓ Saved — restart Hardstop to apply"):toast("Error: "+d.error,true);
+    return d.ok;
+  }catch(e){if(!silent)toast("Save failed: "+e,true);return false;}
+}
+document.getElementById("save-btn").addEventListener("click",()=>saveConfig(false));
 
 // ── Toast ─────────────────────────────────────────────────────────────────────
-let _tt = null;
-function toast(msg, err=false) {
-  const el = document.getElementById("toast");
-  el.textContent = msg;
-  el.className = "show" + (err?" err":"");
-  if (_tt) clearTimeout(_tt);
-  _tt = setTimeout(()=>{ el.className=""; }, 3200);
+let _tt=null;
+function toast(msg,err=false){
+  const el=document.getElementById("toast"); el.textContent=msg; el.className="show"+(err?" err":"");
+  if(_tt)clearTimeout(_tt); _tt=setTimeout(()=>{el.className="";},3200);
 }
 
 boot();
@@ -2071,6 +2337,7 @@ boot();
 # ── Entry point ──────────────────────────────────────────────────────────────
 
 def main() -> None:
+    import signal
     try:
         from AppKit import NSApplication, NSApplicationActivationPolicyAccessory
     except ImportError:
@@ -2081,6 +2348,9 @@ def main() -> None:
 
     app = NSApplication.sharedApplication()
     app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
+
+    # Allow Ctrl-C to quit cleanly
+    signal.signal(signal.SIGINT, lambda *_: app.terminate_(None))
 
     delegate = _AppDelegate.new()
     app.setDelegate_(delegate)

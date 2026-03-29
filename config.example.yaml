@@ -1,0 +1,57 @@
+# hardstop configuration
+# Copy to ~/.hardstop/config.yaml and edit to taste.
+# The app auto-creates this file with defaults on first run.
+
+# ── Google Calendar OAuth ──────────────────────────────────────────────────────
+# Create a Google Cloud Project, enable the Calendar API, and create an
+# OAuth 2.0 Client ID (type: Desktop app) at console.cloud.google.com.
+# Paste the client_id and client_secret here — no file placement needed.
+#
+# Leave this section out (or empty) to run in manual-hardstop-only mode.
+#
+# oauth:
+#   client_id:     "YOUR_CLIENT_ID.apps.googleusercontent.com"
+#   client_secret: "YOUR_CLIENT_SECRET"
+
+# Which calendars to poll. Leave empty to use your primary calendar.
+# calendars:
+#   - "primary"
+#   - "work@example.com"
+calendars: []
+
+# ── Alert levels ───────────────────────────────────────────────────────────────
+# Each entry fires at `minutes_before` minutes before a meeting.
+# Levels are matched by minutes_before; you can add or remove entries.
+#
+# effect options:
+#   normal      — solid border, optional blink
+#   expand      — border grows inward (gradient fade); popup forced to center
+#   snake       — Nokia-Snake spiral crawls inward
+#   game_over   — full-screen retro "GAME OVER" panel
+#   none        — level disabled (no animation fires)
+#
+# popup_pos options: center | top | bottom | none
+#   "none" = no popup; clicking the border snoozes (if higher levels exist)
+#            or shows a dismiss banner (if this is the last level)
+
+alerts:
+  - minutes_before: 5
+    color: "#FFCC00"
+    width: 40
+    blink_hz: 0.5
+    effect: normal
+    popup_pos: top
+
+  - minutes_before: 2
+    color: "#FF6600"
+    width: 80
+    blink_hz: 2.0
+    effect: expand
+    popup_pos: center
+
+  - minutes_before: 0
+    color: "#FF0000"
+    width: 120
+    blink_hz: 4.0
+    effect: game_over
+    popup_pos: center
