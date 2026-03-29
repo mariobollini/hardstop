@@ -1629,7 +1629,7 @@ def _run_config_server() -> None:
         has_credentials = bool(BUNDLED_CLIENT_ID and BUNDLED_CLIENT_SECRET) or CLIENT_SECRET_PATH.exists()
         return jsonify({"authorized": authorized, "has_credentials": has_credentials})
 
-@app.post("/api/open_url")
+    @app.post("/api/open_url")
     def open_url():
         url = request.get_json(force=True).get("url", "")
         if url.startswith("https://"):
