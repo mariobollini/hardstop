@@ -1142,25 +1142,9 @@ class OverlayController:
         self._make_banner(frame, self._label, self._start_dt, forced_cfg)
 
     def snooze(self) -> None:
-        """Advance to the next more-urgent alert level. Dismiss if already at max."""
-        try:
-            idx = next(
-                i for i, a in enumerate(self._all_alerts)
-                if a["minutes_before"] == self._current_cfg["minutes_before"]
-            )
-        except StopIteration:
-            idx = -1
-
-        next_idx = idx + 1
-        if next_idx < len(self._all_alerts):
-            self.show(
-                self._event_id, self._label, self._start_dt,
-                self._all_alerts[next_idx], self._all_alerts,
-                self._tick_target, self._dismiss_cb,
-            )
-        else:
-            # Already at most urgent level — snooze = dismiss
-            self.dismiss()
+        """Close the current overlay without suppressing the event.
+        The scheduler will fire the next level at its natural time."""
+        self._close_no_suppress()
 
     def _close_no_suppress(self) -> None:
         """Tear down the current overlay without calling dismiss_cb.
