@@ -23,11 +23,18 @@ from pathlib import Path
 
 # ── Paths & constants ────────────────────────────────────────────────────────
 
+# ── Google OAuth credentials ──────────────────────────────────────────────────
+# Create a free Google Cloud project, enable the Calendar API, then create an
+# OAuth 2.0 Client ID (type: Desktop app) at console.cloud.google.com.
+# Paste the two values here — this is the only setup step required.
+BUNDLED_CLIENT_ID     = ""
+BUNDLED_CLIENT_SECRET = ""
+
 APP_DIR            = Path.home() / ".hardstop"
 CONFIG_PATH        = APP_DIR / "config.yaml"
 HARDSTOP_PATH      = APP_DIR / "hardstop.json"
 TOKEN_PATH         = APP_DIR / "token.json"
-CLIENT_SECRET_PATH = APP_DIR / "client_secret.json"
+CLIENT_SECRET_PATH = APP_DIR / "client_secret.json"  # legacy fallback
 LAUNCH_AGENT_LABEL = "com.hardstop"
 LAUNCH_AGENT_PATH  = Path.home() / "Library/LaunchAgents" / f"{LAUNCH_AGENT_LABEL}.plist"
 CALENDAR_SCOPES    = ["https://www.googleapis.com/auth/calendar.readonly"]
@@ -250,22 +257,17 @@ def _try_load_cached_token() -> bool:
 def _get_oauth_client_config() -> dict | None:
     """Return OAuth client config dict, or None if not configured.
 
-    Checks config.yaml first (oauth.client_id / oauth.client_secret), then
-    falls back to client_secret.json for backwards compatibility.
+    Uses BUNDLED_CLIENT_ID/SECRET constants; falls back to client_secret.json
+    for legacy compatibility.
     """
-    cfg = load_config()
-    oauth = cfg.get("oauth", {})
-    client_id     = oauth.get("client_id", "").strip()
-    client_secret = oauth.get("client_secret", "").strip()
-
-    if client_id and client_secret:
+    if BUNDLED_CLIENT_ID and BUNDLED_CLIENT_SECRET:
         return {
             "installed": {
-                "client_id":                  client_id,
-                "client_secret":              client_secret,
-                "redirect_uris":              ["http://localhost"],
-                "auth_uri":                   "https://accounts.google.com/o/oauth2/auth",
-                "token_uri":                  "https://oauth2.googleapis.com/token",
+                "client_id":     BUNDLED_CLIENT_ID,
+                "client_secret": BUNDLED_CLIENT_SECRET,
+                "redirect_uris": ["http://localhost"],
+                "auth_uri":      "https://accounts.google.com/o/oauth2/auth",
+                "token_uri":     "https://oauth2.googleapis.com/token",
             }
         }
 
@@ -291,12 +293,7 @@ def authorize_calendar() -> bool:
     if not client_config:
         print(
             "Google Calendar credentials not configured.\n"
-            "Add your OAuth client ID and secret to ~/.hardstop/config.yaml:\n"
-            "\n"
-            "  oauth:\n"
-            "    client_id: \"YOUR_CLIENT_ID.apps.googleusercontent.com\"\n"
-            "    client_secret: \"YOUR_CLIENT_SECRET\"\n"
-            "\n"
+            "Set BUNDLED_CLIENT_ID and BUNDLED_CLIENT_SECRET at the top of hardstop.py.\n"
             "Get credentials at: console.cloud.google.com → APIs & Services → Credentials\n"
             "(Create an OAuth 2.0 Client ID, type: Desktop app)\n"
             "\n"
@@ -1586,34 +1583,10 @@ def _run_config_server() -> None:
     def auth_status():
         with _calendar_lock:
             authorized = _calendar_service is not None
-        cfg = load_config()
-        oauth = cfg.get("oauth", {})
-        has_credentials = bool(
-            oauth.get("client_id", "").strip() and
-            oauth.get("client_secret", "").strip()
-        ) or CLIENT_SECRET_PATH.exists()
+        has_credentials = bool(BUNDLED_CLIENT_ID and BUNDLED_CLIENT_SECRET) or CLIENT_SECRET_PATH.exists()
         return jsonify({"authorized": authorized, "has_credentials": has_credentials})
 
-    @app.post("/api/save_oauth")
-    def save_oauth():
-        import yaml
-        data = request.get_json(force=True)
-        client_id     = data.get("client_id", "").strip()
-        client_secret = data.get("client_secret", "").strip()
-        if not client_id or not client_secret:
-            return jsonify({"ok": False, "error": "client_id and client_secret required"}), 400
-        try:
-            cfg = load_config()
-            cfg["oauth"] = {"client_id": client_id, "client_secret": client_secret}
-            APP_DIR.mkdir(parents=True, exist_ok=True)
-            CONFIG_PATH.write_text(
-                yaml.dump(cfg, default_flow_style=False, sort_keys=False)
-            )
-            return jsonify({"ok": True})
-        except Exception as e:
-            return jsonify({"ok": False, "error": str(e)}), 500
-
-    @app.post("/api/open_url")
+@app.post("/api/open_url")
     def open_url():
         url = request.get_json(force=True).get("url", "")
         if url.startswith("https://"):
@@ -1752,17 +1725,6 @@ select.f-effect option{background:#0c0c0c}
 #cals-input{width:100%;background:#090404;border:1px solid var(--border);color:var(--text);padding:7px 10px;font-size:12px;font-family:"SF Mono",Menlo,monospace;outline:none;resize:vertical;min-height:44px}
 #cals-input:focus{border-color:var(--accent)}
 .cals-hint{font-size:11px;color:var(--muted);margin-top:4px}
-.creds-section{display:flex;flex-direction:column;gap:8px;padding:10px 12px;background:#0a0808;border:1px solid var(--border)}
-.creds-section a{color:var(--accent);text-decoration:none}
-.creds-section a:hover{text-decoration:underline}
-.creds-row{display:flex;align-items:center;gap:10px}
-.creds-label{font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);min-width:90px;flex-shrink:0}
-.creds-input{flex:1;background:#090404;border:1px solid var(--border);color:var(--text);padding:5px 8px;font-size:12px;font-family:"SF Mono",Menlo,monospace;outline:none}
-.creds-input:focus{border-color:var(--accent)}
-.creds-hint{font-size:11px;color:var(--muted)}
-.creds-connect-row{display:flex;justify-content:flex-end;gap:8px;margin-top:2px}
-.creds-edit-link{font-size:11px;color:var(--muted);cursor:pointer;text-decoration:underline;align-self:center}
-.creds-edit-link:hover{color:var(--text)}
 
 /* toast */
 #toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%) translateY(16px);background:#1a2a1a;border:1px solid #335533;color:var(--success);padding:9px 18px;font-size:13px;font-weight:600;opacity:0;transition:opacity .2s,transform .2s;pointer-events:none}
@@ -1807,26 +1769,6 @@ select.f-effect option{background:#0c0c0c}
       <div class="cal-auth-row">
         <span class="cal-auth-status" id="cal-auth-status">Checking…</span>
         <span id="cal-auth-actions" style="display:flex;gap:6px;align-items:center"></span>
-      </div>
-      <div id="cal-creds-section" style="display:none">
-        <div class="creds-section">
-          <div class="creds-hint">
-            Create a free <a href="#" id="gcal-link">Google Cloud project</a>, enable the Calendar API,
-            then create an OAuth 2.0 Client ID (type: <strong>Desktop app</strong>).
-            Paste the credentials below — no files to move.
-          </div>
-          <div class="creds-row">
-            <span class="creds-label">Client ID</span>
-            <input id="cal-client-id" class="creds-input" type="text" placeholder="…googleusercontent.com" autocomplete="off" spellcheck="false">
-          </div>
-          <div class="creds-row">
-            <span class="creds-label">Client Secret</span>
-            <input id="cal-client-secret" class="creds-input" type="password" placeholder="secret" autocomplete="off">
-          </div>
-          <div class="creds-connect-row">
-            <button class="cal-auth-btn" id="cal-connect-btn">Save &amp; Connect →</button>
-          </div>
-        </div>
       </div>
       <div>
         <div class="field-label" style="margin-bottom:6px">Calendar IDs</div>
@@ -1902,39 +1844,25 @@ document.getElementById("default-name-input").addEventListener("input", e => {
 });
 
 // ── Calendar auth ──────────────────────────────────────────────────────────────
-document.getElementById("gcal-link").addEventListener("click", e=>{
-  e.preventDefault();
-  fetch("/api/open_url",{method:"POST",headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({url:"https://console.cloud.google.com/apis/credentials"})});
-});
-
 async function checkAuthStatus() {
   try {
     const d = await (await fetch("/api/auth_status")).json();
     const el=document.getElementById("cal-auth-status");
     const actions=document.getElementById("cal-auth-actions");
-    const credsSection=document.getElementById("cal-creds-section");
     actions.innerHTML="";
 
     if (d.authorized) {
       el.textContent="✓ Google Calendar connected"; el.className="cal-auth-status ok";
       const reauth=document.createElement("button"); reauth.className="cal-auth-btn"; reauth.textContent="Re-authorize";
       reauth.addEventListener("click", triggerAuth);
-      const edit=document.createElement("span"); edit.className="creds-edit-link"; edit.textContent="edit credentials";
-      edit.addEventListener("click",()=>{ credsSection.style.display=credsSection.style.display==="none"?"block":"none"; });
-      actions.appendChild(reauth); actions.appendChild(edit);
-      credsSection.style.display="none";
+      actions.appendChild(reauth);
     } else if (d.has_credentials) {
-      el.textContent="Not connected — click to authorize"; el.className="cal-auth-status";
-      const btn=document.createElement("button"); btn.className="cal-auth-btn"; btn.textContent="Authorize Google Calendar";
-      btn.addEventListener("click", triggerAuth);
-      const edit=document.createElement("span"); edit.className="creds-edit-link"; edit.textContent="edit credentials";
-      edit.addEventListener("click",()=>{ credsSection.style.display=credsSection.style.display==="none"?"block":"none"; });
-      actions.appendChild(btn); actions.appendChild(edit);
-      credsSection.style.display="none";
-    } else {
       el.textContent="Not connected"; el.className="cal-auth-status";
-      credsSection.style.display="block";
+      const btn=document.createElement("button"); btn.className="cal-auth-btn"; btn.textContent="Connect Google Calendar";
+      btn.addEventListener("click", triggerAuth);
+      actions.appendChild(btn);
+    } else {
+      el.textContent="Google Calendar not configured — running in manual mode"; el.className="cal-auth-status";
     }
   } catch(e) {}
 }
@@ -1943,19 +1871,6 @@ async function triggerAuth() {
   try { await fetch("/api/authorize",{method:"POST"}); toast("Browser will open for Google Calendar authorization"); setTimeout(checkAuthStatus,8000); }
   catch(e) { toast("Authorization failed: "+e,true); }
 }
-
-document.getElementById("cal-connect-btn").addEventListener("click", async ()=>{
-  const cid=document.getElementById("cal-client-id").value.trim();
-  const csec=document.getElementById("cal-client-secret").value.trim();
-  if (!cid || !csec) { toast("Paste both Client ID and Client Secret",true); return; }
-  try {
-    const r=await fetch("/api/save_oauth",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({client_id:cid,client_secret:csec})});
-    if (!(await r.json()).ok) throw new Error();
-    await fetch("/api/authorize",{method:"POST"});
-    toast("Browser will open for Google Calendar authorization");
-    setTimeout(checkAuthStatus,8000);
-  } catch(e) { toast("Failed to save credentials",true); }
-});
 
 // ── Themes ────────────────────────────────────────────────────────────────────
 let _openPicker=null; // currently open color picker element

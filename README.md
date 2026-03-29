@@ -13,7 +13,7 @@ Both modes use the same configurable animation system.
 ## Install
 
 ```bash
-git clone https://github.com/mariobellini/hardstop
+git clone https://github.com/mariobollini/hardstop
 cd hardstop
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e .
@@ -26,9 +26,7 @@ The app starts immediately in manual mode. A stop-sign icon appears in the menu 
 
 ## Google Calendar setup (optional)
 
-You need a free Google Cloud Project. No billing required — the Calendar API free quota (1 million requests/day) is far more than this app will ever use.
-
-### One-time setup
+### Step 1 — Google Cloud credentials (one time, free)
 
 1. Go to [console.cloud.google.com](https://console.cloud.google.com)
 2. Create a new project (name it anything — "hardstop" works)
@@ -36,25 +34,37 @@ You need a free Google Cloud Project. No billing required — the Calendar API f
 4. **APIs & Services → Credentials → Create Credentials → OAuth 2.0 Client ID**
    - Application type: **Desktop app**
    - Name: anything
-5. Copy the **Client ID** and **Client Secret** from the credentials page
+5. You'll see a **Client ID** and **Client Secret** — copy both
 
-### Add to config
+### Step 2 — Paste into hardstop.py
 
-Edit `~/.hardstop/config.yaml` (created automatically on first run):
+Open `hardstop.py` and find these two lines near the top (around line 27):
 
-```yaml
-oauth:
-  client_id:     "YOUR_CLIENT_ID.apps.googleusercontent.com"
-  client_secret: "YOUR_CLIENT_SECRET"
+```python
+BUNDLED_CLIENT_ID     = ""
+BUNDLED_CLIENT_SECRET = ""
 ```
 
-Then click **Authorize Google Calendar** in the menu bar. A browser window opens, you sign in with your Google account, grant calendar read access, and you're done. The token is saved locally and auto-refreshed.
+Replace the empty strings with your values:
+
+```python
+BUNDLED_CLIENT_ID     = "123456789-abc.apps.googleusercontent.com"
+BUNDLED_CLIENT_SECRET = "GOCSPX-yourSecretHere"
+```
+
+### Step 3 — Connect
+
+Restart hardstop. Open **Edit Config** from the menu bar, go to **Google Calendar Settings**, and click **Connect Google Calendar**. A browser window opens, you sign in with your Google account, grant calendar read access, and you're done. The token is saved locally and auto-refreshed forever.
+
+> **Note:** The client secret for a Desktop app OAuth flow is not sensitive — it's a public app identifier that can't be kept secret in any installed app. This is a documented Google pattern used by every open source desktop app that accesses Google APIs.
 
 ---
 
 ## Configuration
 
 `~/.hardstop/config.yaml` controls alert timing and animations. See [`config.example.yaml`](config.example.yaml) for all options with comments.
+
+Easier: open **Edit Config** from the menu bar for a visual editor.
 
 ### Alert effects
 
@@ -94,6 +104,6 @@ Log output goes to `~/.hardstop/hardstop.log`.
 | Path | Purpose |
 |------|---------|
 | `~/.hardstop/config.yaml` | Alert timing and animation config |
-| `~/.hardstop/token.json` | Google OAuth token (auto-generated) |
+| `~/.hardstop/token.json` | Google OAuth token (auto-generated, never commit) |
 | `~/.hardstop/hardstop.json` | Active manual hardstop time |
 | `~/.hardstop/hardstop.log` | Log output when running via LaunchAgent |
