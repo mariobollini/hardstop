@@ -2343,6 +2343,12 @@ boot();
 
 def main() -> None:
     import signal
+    import ctypes, ctypes.util
+    try:
+        _libc = ctypes.CDLL(ctypes.util.find_library("c"))
+        _libc.setproctitle(b"hardstop")
+    except Exception:
+        pass
     try:
         from AppKit import NSApplication, NSApplicationActivationPolicyAccessory
     except ImportError:
