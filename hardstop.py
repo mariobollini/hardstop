@@ -1395,7 +1395,7 @@ class _AppDelegate(NSObject):
 
         menu.addItem_(NSMenuItem.separatorItem())
 
-        mi = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("Set Hardstop…", "setHardstop:", "")
+        mi = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("New Hardstop…", "setHardstop:", "")
         mi.setTarget_(self)
         menu.addItem_(mi)
 
