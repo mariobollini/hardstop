@@ -227,6 +227,7 @@ def _make_octagon_icon(filled: bool = False):
 # ── Google Calendar OAuth ────────────────────────────────────────────────────
 
 _calendar_service = None
+_calendar_account = None   # display name fetched after auth
 _calendar_lock = threading.Lock()
 
 
@@ -248,6 +249,7 @@ def _try_load_cached_token() -> bool:
                 return False
         with _calendar_lock:
             _calendar_service = build("calendar", "v3", credentials=creds)
+        _fetch_calendar_account()
         print("Google Calendar: loaded cached credentials.")
         return True
     except Exception as e:
@@ -320,8 +322,25 @@ def authorize_calendar() -> bool:
 
     with _calendar_lock:
         _calendar_service = build("calendar", "v3", credentials=creds)
+    _fetch_calendar_account()
     print("Google Calendar authorized.")
     return True
+
+
+def _fetch_calendar_account() -> None:
+    """Fetch and cache the primary calendar's display name (email address)."""
+    global _calendar_account
+    with _calendar_lock:
+        svc = _calendar_service
+    if not svc:
+        return
+    try:
+        cal = svc.calendarList().get(calendarId="primary").execute()
+        with _calendar_lock:
+            _calendar_account = cal.get("id") or cal.get("summary") or "Google Calendar"
+    except Exception:
+        with _calendar_lock:
+            _calendar_account = "Google Calendar"
 
 
 def _fetch_upcoming_events(calendars: list) -> list[tuple[str, str, datetime]]:
@@ -1372,7 +1391,7 @@ class _AppDelegate(NSObject):
 
         menu.addItem_(NSMenuItem.separatorItem())
 
-        mi = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("Edit Config…", "editConfig:", "")
+        mi = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("Configure…", "editConfig:", "")
         mi.setTarget_(self)
         menu.addItem_(mi)
 
@@ -1415,7 +1434,10 @@ class _AppDelegate(NSObject):
     def _auth_label(self) -> str:
         with _calendar_lock:
             has_svc = _calendar_service is not None
-        return "Re-authorize Calendar" if has_svc else "Authorize Google Calendar"
+            account = _calendar_account
+        if has_svc and account:
+            return f"Google Calendar: {account}"
+        return "Connect Google Calendar"
 
     @objc.python_method
     def _refresh_hardstop_item(self) -> None:
