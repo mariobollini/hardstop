@@ -819,7 +819,10 @@ class _BannerView(NSView):
     def _countdown(self) -> str:
         if not self._start_dt:
             return ""
-        secs = int((self._start_dt - datetime.now(tz=timezone.utc)).total_seconds())
+        start = self._start_dt
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=timezone.utc)
+        secs = int((start - datetime.now(tz=timezone.utc)).total_seconds())
         if secs > 0:
             m, s = divmod(secs, 60)
             return f"{m}:{s:02d}"
@@ -913,7 +916,7 @@ class _BannerView(NSView):
         else:
             countdown  = self._countdown()
             event_time = self._event_time()
-            rest = f"  {event_time}  {self._label.upper()}" if event_time else f"  {self._label.upper()}"
+            rest = f" — {event_time}  {self._label.upper()}" if event_time else f"  {self._label.upper()}"
             ms = NSMutableAttributedString.alloc().initWithString_attributes_(
                 countdown + rest, {
                     NSFontAttributeName:            retro_font(font_size),
@@ -1335,7 +1338,8 @@ class _AppDelegate(NSObject):
         self._pending_alert: tuple | None = None
         self._icon_is_filled = False
 
-        self._scheduler = AlertScheduler(self._config, self._on_alert_from_thread)
+        self._scheduler  = AlertScheduler(self._config, self._on_alert_from_thread)
+        self._poll_event = threading.Event()
         threading.Thread(target=self._poll_loop, daemon=True).start()
         threading.Thread(target=_try_load_cached_token, daemon=True).start()
 
@@ -1404,6 +1408,10 @@ class _AppDelegate(NSObject):
         self._auth_item.setTarget_(self)
         menu.addItem_(self._auth_item)
 
+        mi = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("Refresh Events", "refreshCalendar:", "r")
+        mi.setTarget_(self)
+        menu.addItem_(mi)
+
         menu.addItem_(NSMenuItem.separatorItem())
 
         self._login_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
@@ -1469,7 +1477,8 @@ class _AppDelegate(NSObject):
                 self._upcoming = self._scheduler.poll()
             except Exception as e:
                 print(f"Poll error: {e}")
-            time.sleep(60)
+            self._poll_event.wait(60)
+            self._poll_event.clear()
 
     # ── Alert routing (background thread → main thread) ──────────────────────
 
@@ -1589,6 +1598,9 @@ class _AppDelegate(NSObject):
 
     def authorizeCalendar_(self, _sender) -> None:
         threading.Thread(target=authorize_calendar, args=(True,), daemon=True).start()
+
+    def refreshCalendar_(self, _sender) -> None:
+        self._poll_event.set()
 
     def toggleLoginItem_(self, sender) -> None:
         enabled = not _login_item_enabled()
