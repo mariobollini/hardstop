@@ -379,7 +379,8 @@ def _fetch_upcoming_events(calendars: list) -> list[tuple[str, str, datetime]]:
                 dt = datetime.fromisoformat(s)
                 if dt.tzinfo is None:
                     dt = dt.replace(tzinfo=timezone.utc)
-                results.append((event["id"], event.get("summary", "Meeting"), dt))
+                location = event.get("location", "") or ""
+                results.append((event["id"], event.get("summary", "Meeting"), dt, location))
         except Exception as e:
             print(f"Calendar fetch error ({cal_id}): {e}")
 
@@ -418,7 +419,8 @@ def _fetch_ics_events(ics_urls: list) -> list[tuple[str, str, datetime]]:
                                        tzinfo=timezone.utc)
                 elif dtstart.tzinfo is None:
                     dtstart = dtstart.replace(tzinfo=timezone.utc)
-                results.append((uid, summary, dtstart))
+                location = str(event.get("LOCATION", "")) or ""
+                results.append((uid, summary, dtstart, location))
         except Exception as e:
             print(f"ICS fetch error ({url}): {e}")
 
@@ -549,7 +551,7 @@ class AlertScheduler:
             reverse=True,  # [5min, 2min, 0min]
         )
 
-        for event_id, label, start_dt in events:
+        for event_id, label, start_dt, location in events:
             for alert in alerts_desc:
                 if alert.get("effect") == "none":
                     continue  # level disabled — no alarm
@@ -561,10 +563,10 @@ class AlertScheduler:
                         continue
                     if abs(now - target) <= timedelta(seconds=45):
                         self._fired.add(key)
-                        self._on_alert(event_id, label, start_dt, alert, alerts_desc)
+                        self._on_alert(event_id, label, start_dt, location, alert, alerts_desc)
 
         upcoming = [
-            (lbl, dt) for _, lbl, dt in events
+            (lbl, dt) for _, lbl, dt, _ in events
             if dt > datetime.now(tz=timezone.utc)
         ]
         upcoming.sort(key=lambda x: x[1])
@@ -798,6 +800,7 @@ class _BannerView(NSView):
         self._game_over       = False
         self._at_start        = False
         self._dismiss_pending = False
+        self._location   = ""
         self._snooze_cb  = None
         self._dismiss_cb = None
         self._snooze_rect  = None
@@ -807,7 +810,8 @@ class _BannerView(NSView):
     @objc.python_method
     def configure(self, label: str, start_dt, alert_cfg: dict,
                   popup_font: str, game_over: bool,
-                  snooze_cb, dismiss_cb) -> None:
+                  location: str = "",
+                  snooze_cb=None, dismiss_cb=None) -> None:
         self._label      = label
         self._start_dt   = start_dt
         self._cfg        = alert_cfg
@@ -815,6 +819,7 @@ class _BannerView(NSView):
         self._game_over       = game_over
         self._at_start        = alert_cfg.get("minutes_before", 0) == 0
         self._dismiss_pending = False
+        self._location   = location or ""
         self._snooze_cb  = snooze_cb
         self._dismiss_cb = dismiss_cb
         self.setNeedsDisplay_(True)
@@ -904,7 +909,12 @@ class _BannerView(NSView):
         # In dismiss-pending state: show confirm message instead
         font_size  = 19.0
         line_h     = font_size + 8
-        text_y     = (fh - line_h) / 2.0
+        loc_font_size = 11.0
+        loc_line_h    = loc_font_size + 6
+        loc_gap       = 5.0
+        has_location  = bool(self._location) and not self._dismiss_pending
+        total_text_h  = (line_h + loc_gap + loc_line_h) if has_location else line_h
+        text_y     = (fh - total_text_h) / 2.0 + (loc_gap + loc_line_h if has_location else 0)
 
         if self._dismiss_pending:
             confirm_text = "CLEARS ALL REMINDERS FOR THIS EVENT"
@@ -939,6 +949,19 @@ class _BannerView(NSView):
             ms.drawInRect_(NSMakeRect(pad, text_y, fw - 2 * pad, line_h))
         else:
             ms.drawInRect_(NSMakeRect(pad, text_y, text_right - pad, line_h))
+            if has_location:
+                loc_y = text_y - loc_gap - loc_line_h
+                loc_font = NSFont.fontWithName_size_("Monaco", loc_font_size) or NSFont.systemFontOfSize_(loc_font_size)
+                loc_ps = NSMutableParagraphStyle.new()
+                loc_ps.setAlignment_(NSLeftTextAlignment)
+                loc_ms = NSMutableAttributedString.alloc().initWithString_attributes_(
+                    self._location, {
+                        NSFontAttributeName:            loc_font,
+                        NSForegroundColorAttributeName: NSColor.colorWithWhite_alpha_(1.0, 0.35),
+                        NSParagraphStyleAttributeName:  loc_ps,
+                    }
+                )
+                loc_ms.drawInRect_(NSMakeRect(pad, loc_y, text_right - pad, loc_line_h))
 
         btn_font_size = 14.0
         if single_btn:
@@ -1071,12 +1094,13 @@ class OverlayController:
     def is_active(self) -> bool:
         return self._current_cfg is not None
 
-    def show(self, event_id: str, label: str, start_dt, alert_cfg: dict,
+    def show(self, event_id: str, label: str, start_dt, location: str, alert_cfg: dict,
              all_alerts: list, tick_target, dismiss_cb) -> None:
         """Display overlay. Replaces any existing overlay."""
         self._teardown()
         self._event_id    = event_id
         self._label       = label
+        self._location    = location
         self._start_dt    = start_dt
         self._current_cfg = alert_cfg
         self._all_alerts  = all_alerts  # [5min, 2min, 0min]
@@ -1097,7 +1121,7 @@ class OverlayController:
         from AppKit import NSScreen
         frame = NSScreen.mainScreen().frame()
         self._make_border(frame, alert_cfg)
-        self._make_banner(frame, label, start_dt, alert_cfg)
+        self._make_banner(frame, label, start_dt, location, alert_cfg)
 
         # When there's no popup, clicks on the border overlay act as snooze (if a
         # more-urgent level follows) or summon the banner (if already at max urgency).
@@ -1139,7 +1163,7 @@ class OverlayController:
         frame = NSScreen.mainScreen().frame()
         # Force center popup regardless of config (we're summoning it on demand)
         forced_cfg = {**self._current_cfg, "popup_pos": "center"}
-        self._make_banner(frame, self._label, self._start_dt, forced_cfg)
+        self._make_banner(frame, self._label, self._start_dt, self._location, forced_cfg)
 
     def snooze(self) -> None:
         """Close the current overlay without suppressing the event.
@@ -1198,7 +1222,7 @@ class OverlayController:
         self._border_win  = win
         self._border_view = view
 
-    def _make_banner(self, screen_frame, label, start_dt, cfg) -> None:
+    def _make_banner(self, screen_frame, label, start_dt, location, cfg) -> None:
         from AppKit import (
             NSPanel, NSBorderlessWindowMask, NSBackingStoreBuffered, NSColor,
             NSWindowCollectionBehaviorCanJoinAllSpaces,
@@ -1224,7 +1248,7 @@ class OverlayController:
         sw, sh = screen_frame.size.width, screen_frame.size.height
 
         bw = min(sw * 0.65, 860.0)
-        bh = 96.0
+        bh = 130.0 if location else 96.0
 
         bx = (sw - bw) / 2
         if popup_pos == "top":
@@ -1250,6 +1274,7 @@ class OverlayController:
 
         view = _BannerView.alloc().initWithFrame_(NSMakeRect(0, 0, bw, bh))
         view.configure(label, start_dt, cfg, popup_font, game_over,
+                       location=location,
                        snooze_cb=self.snooze,
                        dismiss_cb=self.dismiss)
         banner.setContentView_(view)
@@ -1470,8 +1495,8 @@ class _AppDelegate(NSObject):
     # ── Alert routing (background thread → main thread) ──────────────────────
 
     def _on_alert_from_thread(self, event_id: str, label: str, start_dt,
-                              alert_cfg: dict, all_alerts: list) -> None:
-        self._pending_alert = (event_id, label, start_dt, alert_cfg, all_alerts)
+                              location: str, alert_cfg: dict, all_alerts: list) -> None:
+        self._pending_alert = (event_id, label, start_dt, location, alert_cfg, all_alerts)
         self.performSelectorOnMainThread_withObject_waitUntilDone_(
             "showPendingAlert:", None, False
         )
@@ -1479,7 +1504,7 @@ class _AppDelegate(NSObject):
     def showPendingAlert_(self, _) -> None:
         if not self._pending_alert:
             return
-        event_id, label, start_dt, cfg, all_alerts = self._pending_alert
+        event_id, label, start_dt, location, cfg, all_alerts = self._pending_alert
         self._pending_alert = None
 
         # Don't replace an active overlay with a less-urgent one
@@ -1488,7 +1513,7 @@ class _AppDelegate(NSObject):
                 return
 
         self._overlay.show(
-            event_id, label, start_dt, cfg, all_alerts,
+            event_id, label, start_dt, location, cfg, all_alerts,
             tick_target=self,
             dismiss_cb=lambda: self._on_dismiss(event_id),
         )
@@ -1551,7 +1576,7 @@ class _AppDelegate(NSObject):
                     start_dt = datetime.now(tz=timezone.utc)
                     label = name if name != "Hardstop" else f"Test Level {level_idx + 1}"
                     self._on_alert_from_thread(
-                        f"__test_{level_idx}__", label, start_dt, cfg, alerts_desc,
+                        f"__test_{level_idx}__", label, start_dt, "", cfg, alerts_desc,
                     )
                 return
 
@@ -1682,7 +1707,7 @@ def _run_config_server() -> None:
         start_dt = datetime.now(tz=timezone.utc)
         _app_delegate._on_alert_from_thread(
             f"__preview_{level_idx}__", f"Preview Level {n}",
-            start_dt, alert_cfg, alerts_desc,
+            start_dt, "", alert_cfg, alerts_desc,
         )
         return jsonify({"ok": True})
 
