@@ -15,6 +15,8 @@ dependencies = [
     "PyYAML>=6.0",
     "Flask>=3.0",
     "waitress>=3.0",
+    "icalendar>=5.0",
+    "recurring-ical-events>=2.0",
 ]
 
 [project.scripts]

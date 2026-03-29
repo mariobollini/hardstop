@@ -24,7 +24,22 @@ The app starts immediately in manual mode. A stop-sign icon appears in the menu 
 
 ---
 
-## Google Calendar setup (optional)
+## Calendar sync
+
+### Option A — ICS feed (no setup, works with any calendar)
+
+Open **Edit Config** from the menu bar → **Google Calendar Settings** → paste one or more ICS feed URLs, one per line.
+
+Where to get your ICS URL:
+- **Google Calendar**: Settings → click the calendar name → "Secret address in iCal format" → copy the link
+- **Outlook / Microsoft 365**: Calendar → Share → Publish → ICS link
+- **Apple Calendar / iCloud**: right-click calendar → Share Calendar → enable public calendar → copy URL
+
+ICS feeds are polled every 60 seconds alongside any Google Calendar API connection.
+
+---
+
+### Option B — Google Calendar API (optional)
 
 ### Step 1 — Google Cloud credentials (one time, free)
 

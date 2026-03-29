@@ -13,6 +13,17 @@
 #   client_id:     "YOUR_CLIENT_ID.apps.googleusercontent.com"
 #   client_secret: "YOUR_CLIENT_SECRET"
 
+# ── ICS feed URLs ─────────────────────────────────────────────────────────────
+# Works with any calendar service — no OAuth setup required.
+# Google Calendar: Settings → [calendar name] → "Secret address in iCal format"
+# Outlook: Calendar → Share → Publish → ICS link
+# iCloud: right-click calendar → Share Calendar → enable public calendar → copy URL
+#
+# ics_urls:
+#   - "https://calendar.google.com/calendar/ical/…/basic.ics"
+ics_urls: []
+
+# ── Google Calendar API (optional, requires OAuth setup) ──────────────────────
 # Which calendars to poll. Leave empty to use your primary calendar.
 # calendars:
 #   - "primary"

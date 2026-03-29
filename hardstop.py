@@ -44,6 +44,7 @@ _OVERLAY_LEVEL = 1001
 
 DEFAULT_CONFIG = {
     "calendars": [],
+    "ics_urls": [],
     "popup_font": "retro",
     "popup_pos":  "center",   # global fallback
     "default_name": "You have a hard stop!",
@@ -359,6 +360,45 @@ def _fetch_upcoming_events(calendars: list) -> list[tuple[str, str, datetime]]:
     return results
 
 
+def _fetch_ics_events(ics_urls: list) -> list[tuple[str, str, datetime]]:
+    """Fetch ICS feed URLs and return (event_id, summary, start_dt) for upcoming events."""
+    if not ics_urls:
+        return []
+    try:
+        from icalendar import Calendar
+        import recurring_ical_events
+    except ImportError:
+        print("ICS support requires: pip install icalendar recurring-ical-events")
+        return []
+
+    import urllib.request
+    now = datetime.now(tz=timezone.utc)
+    t_max = now + timedelta(hours=6)
+    results = []
+
+    for url in ics_urls:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "hardstop/1.0"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = resp.read()
+            cal = Calendar.from_ical(data)
+            for event in recurring_ical_events.of(cal).between(now, t_max):
+                summary = str(event.get("SUMMARY", "Event"))
+                uid     = str(event.get("UID", f"ics-{summary}"))
+                dtstart = event.get("DTSTART").dt
+                if not isinstance(dtstart, datetime):
+                    # All-day event (date only) — treat as midnight UTC
+                    dtstart = datetime(dtstart.year, dtstart.month, dtstart.day,
+                                       tzinfo=timezone.utc)
+                elif dtstart.tzinfo is None:
+                    dtstart = dtstart.replace(tzinfo=timezone.utc)
+                results.append((uid, summary, dtstart))
+        except Exception as e:
+            print(f"ICS fetch error ({url}): {e}")
+
+    return results
+
+
 # ── Manual hardstop ──────────────────────────────────────────────────────────
 
 def load_hardstop() -> tuple[datetime, str] | None:
@@ -464,7 +504,10 @@ class AlertScheduler:
 
     def poll(self) -> list[tuple[str, datetime]]:
         now = datetime.now(tz=timezone.utc)
-        events = _fetch_upcoming_events(self._config.get("calendars", []))
+        events = (
+            _fetch_upcoming_events(self._config.get("calendars", [])) +
+            _fetch_ics_events(self._config.get("ics_urls", []))
+        )
 
         hs = load_hardstop()
         if hs:
@@ -1766,11 +1809,18 @@ select.f-effect option{background:#0c0c0c}
   <details class="panel-wrap">
     <summary>Google Calendar Settings</summary>
     <div class="panel-inner">
-      <div class="cal-auth-row">
-        <span class="cal-auth-status" id="cal-auth-status">Checking…</span>
-        <span id="cal-auth-actions" style="display:flex;gap:6px;align-items:center"></span>
-      </div>
       <div>
+        <div class="field-label" style="margin-bottom:6px">ICS Feed URLs</div>
+        <textarea id="ics-input" rows="3"
+          placeholder="One URL per line. Works with Google Calendar, Outlook, Apple Calendar, iCloud…"></textarea>
+        <div class="cals-hint">Google Calendar: Settings → [calendar] → "Secret address in iCal format" &nbsp;·&nbsp; Outlook: publish calendar → ICS link &nbsp;·&nbsp; iCloud: share calendar → copy link</div>
+      </div>
+      <div id="gcal-api-section">
+        <div class="field-label" style="margin-bottom:4px">Google Calendar API <span style="font-weight:400;color:var(--muted);font-size:11px">(optional — ICS above works without this)</span></div>
+        <div class="cal-auth-row" style="margin-bottom:6px">
+          <span class="cal-auth-status" id="cal-auth-status">Checking…</span>
+          <span id="cal-auth-actions" style="display:flex;gap:6px;align-items:center"></span>
+        </div>
         <div class="field-label" style="margin-bottom:6px">Calendar IDs</div>
         <textarea id="cals-input" rows="2"
           placeholder="Leave empty for primary calendar. One calendar ID per line."></textarea>
@@ -1803,7 +1853,7 @@ const THEME_PRESETS = [
 
 const CP_PRESETS=["#FFCC00","#FF8800","#FF4400","#FF0000","#FF44BB","#AA22FF","#88DDFF","#44FF88","#CCFF44","#FFFFFF"];
 
-let state = { calendars:[], alerts:[], popup_font:"retro", popup_pos:"center", default_name:"You have a hard stop!" };
+let state = { calendars:[], ics_urls:[], alerts:[], popup_font:"retro", popup_pos:"center", default_name:"You have a hard stop!" };
 let rafs = {};
 
 function nearestDisc(btns, val) {
@@ -1817,6 +1867,7 @@ async function boot() {
   try {
     const cfg = await (await fetch("/api/config")).json();
     state.calendars    = cfg.calendars    || [];
+    state.ics_urls     = cfg.ics_urls     || [];
     state.alerts       = cfg.alerts       || [];
     state.popup_font   = cfg.popup_font   || "retro";
     state.popup_pos    = cfg.popup_pos    || "center";
@@ -1831,6 +1882,7 @@ async function boot() {
       }
       if (!a.popup_pos) a.popup_pos = state.popup_pos;
     });
+    document.getElementById("ics-input").value  = state.ics_urls.join("\n");
     document.getElementById("cals-input").value = state.calendars.join("\n");
     document.getElementById("default-name-input").value = state.default_name;
     renderAlerts();
@@ -2223,10 +2275,11 @@ function drawSnake(ctx,W,H,w,r,g,b,totalCoverage){
 
 // ── Save ──────────────────────────────────────────────────────────────────────
 async function saveConfig(silent=false){
+  state.ics_urls =(document.getElementById("ics-input").value.trim()||"").split("\n").map(s=>s.trim()).filter(Boolean);
   state.calendars=(document.getElementById("cals-input").value.trim()||"").split("\n").map(s=>s.trim()).filter(Boolean);
   try{
     const d=await(await fetch("/api/config",{method:"POST",headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({calendars:state.calendars,alerts:state.alerts,popup_font:state.popup_font,popup_pos:state.popup_pos,default_name:state.default_name})})).json();
+      body:JSON.stringify({calendars:state.calendars,ics_urls:state.ics_urls,alerts:state.alerts,popup_font:state.popup_font,popup_pos:state.popup_pos,default_name:state.default_name})})).json();
     if(!silent) d.ok?toast("✓ Saved — restart Hardstop to apply"):toast("Error: "+d.error,true);
     return d.ok;
   }catch(e){if(!silent)toast("Save failed: "+e,true);return false;}
