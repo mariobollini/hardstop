@@ -257,6 +257,9 @@ def _try_load_cached_token() -> bool:
             )
         print("Google Calendar: loaded cached credentials.")
         return True
+    except ImportError:
+        print("Google libraries not installed — run: pip install -e . in the hardstop directory")
+        return False
     except Exception as e:
         print(f"Cached token load failed: {e}")
         return False
@@ -1090,6 +1093,7 @@ class OverlayController:
         self._tick_target = None
         self._popup_pos       = "center"
         self._snake_coverage  = 0.0
+        self._expand_extra    = 0.0
         self._last_tick_t     = 0.0
         self._auto_dismiss_after = None
         self._auto_dismiss_fn    = None   # callable used by tick(); None → self.dismiss
@@ -1113,6 +1117,7 @@ class OverlayController:
         self._tick_target = tick_target
         self._start_time     = time.time()
         self._snake_coverage = 0.0
+        self._expand_extra   = 0.0
         self._last_tick_t    = time.time()
 
         # Auto-dismiss: always, 5 minutes after meeting starts
@@ -1339,8 +1344,10 @@ class OverlayController:
                 self._border_view.set_snake_coverage(self._snake_coverage)
 
         elif effect == "expand":
-            elapsed = t - self._start_time
-            self._border_view.set_extra_width(elapsed * 24.0)  # 24 px/sec
+            # Grow only during the "bright" phase of the blink — wave closing in
+            growth = max(0.0, (alpha - 0.7) / 0.3)
+            self._expand_extra += dt * 50.0 * growth
+            self._border_view.set_extra_width(self._expand_extra)
 
         if self._banner_view:
             self._banner_view.setNeedsDisplay_(True)
@@ -1840,6 +1847,8 @@ select.f-effect option{background:#0c0c0c}
 .alert-card.level-disabled .card-fields>*:not(:first-child){opacity:.3;pointer-events:none}
 /* popup locked (effect=expand: center only) */
 .alert-card.popup-locked .f-popup-btn:not([data-val="center"]){opacity:.25;pointer-events:none}
+/* game over: width and blink not applicable */
+.alert-card.game-over-locked .two-col-row{display:none}
 
 /* themes */
 .themes-list{display:flex;flex-direction:column;gap:3px}
@@ -2169,8 +2178,8 @@ function renderAlerts() {
 function buildCard(a, idx, levelNum) {
   const card=document.createElement("div"); card.dataset.idx=idx;
   const eff=a.effect||(a.game_over?"game_over":a.snake_mode?"snake":a.expand?"expand":a.gradient?"fade":"normal");
-  card.className="alert-card"+(eff==="none"?" level-disabled":"")+(eff==="expand"?" popup-locked":"");
   const isSnake=eff==="snake", isGO=eff==="game_over";
+  card.className="alert-card"+(eff==="none"?" level-disabled":"")+(eff==="expand"?" popup-locked":"")+(isGO?" game-over-locked":"");
   card.innerHTML=`
 <div class="card-header">
   <span class="level-badge">Level ${levelNum}</span>
@@ -2188,7 +2197,7 @@ function buildCard(a, idx, levelNum) {
       <option value="snake"     ${eff==="snake"    ?"selected":""}>Snake — crawling spiral</option>
       <option value="game_over" ${eff==="game_over"?"selected":""}>Game Over — full screen</option>
     </select>
-    <div class="effect-note"${isGO?' style="display:block"':''}>Full screen takeover. Auto-dismisses after 2 min.</div>
+    <div class="effect-note"${isGO?' style="display:block"':''}>Full screen takeover. Auto-dismisses 5 min after meeting starts.</div>
   </div>
   <div class="two-col-row">
     <div class="field-group">
@@ -2240,8 +2249,9 @@ function wireCard(card, idx) {
     const eff=effectSel.value; state.alerts[idx].effect=eff;
     snakeFields.style.display=eff==="snake"?"block":"none";
     effectNote.style.display=eff==="game_over"?"block":"none";
-    card.classList.toggle("level-disabled", eff==="none");
-    card.classList.toggle("popup-locked",   eff==="expand");
+    card.classList.toggle("level-disabled",   eff==="none");
+    card.classList.toggle("popup-locked",     eff==="expand");
+    card.classList.toggle("game-over-locked", eff==="game_over");
     if (eff==="expand") {
       // Force popup to center
       state.alerts[idx].popup_pos="center";
@@ -2312,18 +2322,22 @@ function drawPreview(canvas, a, t) {
     }
     canvas._snakeT=t; drawSnake(ctx,W,H,baseW,r,g,b,canvas._coverage||0); return;
   }
+  // Compute alpha first (expand uses halved blink_hz, matching Python)
+  const rawBlink=+a.blink_hz||0;
+  const effectiveBlink=(effect==="expand")?rawBlink*0.5:rawBlink;
+  let alpha=(effectiveBlink>0&&effect!=="snake"&&effect!=="game_over")
+    ?0.4+0.6*Math.abs(Math.sin(Math.PI*effectiveBlink*t)):1.0;
   let w=baseW;
   if (effect==="expand") {
     if (canvas._expandT!==undefined) {
       const dt=Math.min(t-canvas._expandT,0.1);
-      canvas._expandExtra=(canvas._expandExtra||0)+dt*24.0;
+      const growth=Math.max(0,(alpha-0.7)/0.3);
+      canvas._expandExtra=(canvas._expandExtra||0)+dt*50.0*growth;
       const maxExtra=Math.floor(W/2)-baseW;
       if (canvas._expandExtra>=maxExtra) canvas._expandExtra=maxExtra;
     }
     canvas._expandT=t; w=Math.min(Math.floor(W/2),baseW+(canvas._expandExtra||0));
   }
-  let alpha=1.0;
-  if ((+a.blink_hz||0)>0) alpha=0.4+0.6*Math.abs(Math.sin(Math.PI*a.blink_hz*t));
   if (effect==="expand") drawBorderGradient(ctx,W,H,w,r,g,b,alpha);
   else drawBorder(ctx,W,H,w,r,g,b,alpha);
 }
