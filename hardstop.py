@@ -2450,8 +2450,10 @@ def main() -> None:
     app = NSApplication.sharedApplication()
     app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
 
-    # Allow Ctrl-C to quit cleanly
-    signal.signal(signal.SIGINT, lambda *_: app.terminate_(None))
+    # Restore default OS SIGINT handler so Ctrl-C works from the terminal.
+    # A Python-level lambda won't fire here because the Cocoa event loop
+    # owns the main thread and Python's eval loop never gets to check signals.
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
 
     delegate = _AppDelegate.new()
     app.setDelegate_(delegate)
