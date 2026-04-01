@@ -168,11 +168,11 @@ def _set_login_item(enabled: bool) -> None:
 # ── Menu bar icon (stop-sign octagon) ───────────────────────────────────────
 
 def _make_octagon_icon_colored():
-    """64×64 red filled octagon for use in NSAlert dialogs."""
+    """64×64 octagon outline for use in NSAlert dialogs."""
     from AppKit import NSImage, NSBezierPath, NSColor
     W, H = 64.0, 64.0
     cx, cy = W / 2, H / 2
-    r = W / 2 - 4
+    r = W / 2 - 6
     image = NSImage.alloc().initWithSize_((W, H))
     image.lockFocus()
     path = NSBezierPath.bezierPath()
@@ -185,8 +185,9 @@ def _make_octagon_icon_colored():
         else:
             path.lineToPoint_((x, y))
     path.closePath()
-    NSColor.colorWithRed_green_blue_alpha_(0.8, 0.13, 0.0, 1.0).set()
-    path.fill()
+    path.setLineWidth_(3.0)
+    NSColor.whiteColor().set()
+    path.stroke()
     image.unlockFocus()
     return image
 
@@ -543,7 +544,7 @@ class AlertScheduler:
             if now > hs_dt + timedelta(minutes=5):
                 clear_hardstop()
             else:
-                events.append(("__hardstop__", hs_name, hs_dt))
+                events.append(("__hardstop__", hs_name, hs_dt, ""))
 
         alerts_desc = sorted(
             self._config.get("alerts", []),
@@ -561,7 +562,7 @@ class AlertScheduler:
                 with self._lock:
                     if key in self._fired:
                         continue
-                    if abs(now - target) <= timedelta(seconds=45):
+                    if timedelta(0) <= now - target <= timedelta(seconds=90):
                         self._fired.add(key)
                         self._on_alert(event_id, label, start_dt, location, alert, alerts_desc)
 
@@ -831,10 +832,12 @@ class _BannerView(NSView):
         start = self._start_dt
         if start.tzinfo is None:
             start = start.replace(tzinfo=timezone.utc)
-        secs = int((start - datetime.now(tz=timezone.utc)).total_seconds())
-        if secs > 0:
-            m, s = divmod(secs, 60)
-            return f"{m}:{s:02d}"
+        total = (start - datetime.now(tz=timezone.utc)).total_seconds()
+        if total > 0:
+            m  = int(total // 60)
+            s  = int(total % 60)
+            cs = int((total % 1) * 100)
+            return f"{m}:{s:02d}.{cs:02d}"
         return "NOW"
 
     @objc.python_method
@@ -1083,6 +1086,7 @@ class OverlayController:
         self._event_id    = ""
         self._all_alerts: list = []   # sorted minutes_before descending
         self._dismiss_cb  = None
+        self._snooze_cb   = None
         self._tick_target = None
         self._popup_pos       = "center"
         self._snake_coverage  = 0.0
@@ -1095,7 +1099,7 @@ class OverlayController:
         return self._current_cfg is not None
 
     def show(self, event_id: str, label: str, start_dt, location: str, alert_cfg: dict,
-             all_alerts: list, tick_target, dismiss_cb) -> None:
+             all_alerts: list, tick_target, dismiss_cb, snooze_cb=None) -> None:
         """Display overlay. Replaces any existing overlay."""
         self._teardown()
         self._event_id    = event_id
@@ -1105,18 +1109,21 @@ class OverlayController:
         self._current_cfg = alert_cfg
         self._all_alerts  = all_alerts  # [5min, 2min, 0min]
         self._dismiss_cb  = dismiss_cb
+        self._snooze_cb   = snooze_cb
         self._tick_target = tick_target
         self._start_time     = time.time()
         self._snake_coverage = 0.0
         self._last_tick_t    = time.time()
 
-        # Auto-dismiss: game_over always; "none" popup_pos always
+        # Auto-dismiss: always, 5 minutes after meeting starts
         effect    = alert_cfg.get("effect", "normal")
         popup_lvl = alert_cfg.get("popup_pos", "center")
-        if effect == "game_over" or popup_lvl == "none":
-            self._auto_dismiss_after = 120.0
+        if start_dt is not None:
+            _sd = start_dt if start_dt.tzinfo else start_dt.replace(tzinfo=timezone.utc)
+            secs_until = (_sd - datetime.now(tz=timezone.utc)).total_seconds()
+            self._auto_dismiss_after = max(0.0, secs_until) + 300.0
         else:
-            self._auto_dismiss_after = None
+            self._auto_dismiss_after = 300.0
 
         from AppKit import NSScreen
         frame = NSScreen.mainScreen().frame()
@@ -1173,7 +1180,12 @@ class OverlayController:
     def _close_no_suppress(self) -> None:
         """Tear down the current overlay without calling dismiss_cb.
         The scheduler will fire the next level naturally when its time comes."""
+        cb         = self._snooze_cb
+        event_id   = self._event_id
+        label      = self._label
         self._teardown()
+        if cb:
+            cb(event_id, label)
 
     def dismiss(self) -> None:
         cb = self._dismiss_cb
@@ -1301,6 +1313,8 @@ class OverlayController:
 
         effect   = cfg.get("effect", "normal")
         blink_hz = cfg.get("blink_hz", 0)
+        if effect == "expand":
+            blink_hz = blink_hz * 0.5
         # Snake and Game Over are always fully opaque — blink doesn't apply
         alpha = (
             0.4 + 0.6 * abs(math.sin(math.pi * blink_hz * t))
@@ -1350,6 +1364,7 @@ class _AppDelegate(NSObject):
         self._upcoming: list[tuple[str, datetime]] = []
         self._pending_alert: tuple | None = None
         self._icon_is_filled = False
+        self._snoozed_events: dict[str, str] = {}  # event_id → label
 
         self._scheduler  = AlertScheduler(self._config, self._on_alert_from_thread)
         self._poll_event = threading.Event()
@@ -1389,10 +1404,21 @@ class _AppDelegate(NSObject):
 
         menu = NSMenu.new()
 
-        self._next_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-            self._next_event_label(), None, ""
+        # Up to 5 upcoming-event rows; rebuilt each refresh cycle
+        self._event_items = []
+        for _ in range(5):
+            mi = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("", None, "")
+            mi.setEnabled_(True)
+            mi.setHidden_(True)
+            menu.addItem_(mi)
+            self._event_items.append(mi)
+        # Placeholder shown when no events
+        self._no_events_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "No upcoming events", None, ""
         )
-        menu.addItem_(self._next_item)
+        self._no_events_item.setEnabled_(True)
+        menu.addItem_(self._no_events_item)
+        self._refresh_event_items()
 
         # Active hardstop row (hidden when none set)
         self._hs_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
@@ -1446,12 +1472,42 @@ class _AppDelegate(NSObject):
         self._status_item.setMenu_(menu)
 
     @objc.python_method
-    def _next_event_label(self) -> str:
-        if self._upcoming:
-            label, dt = self._upcoming[0]
+    def _refresh_event_items(self) -> None:
+        now_local = datetime.now().astimezone()
+        today = now_local.date()
+
+        events_today = []
+        for label, dt in self._upcoming:
+            dt_local = dt.astimezone() if dt.tzinfo else dt
+            if dt_local.date() != today:
+                continue
+            events_today.append((label, dt, dt_local))
+            if len(events_today) >= 5:
+                break
+
+        # Build display rows
+        rows = []
+        for label, dt, dt_local in events_today:
             mins = max(0, int((dt - datetime.now(tz=timezone.utc)).total_seconds() / 60))
-            return f"Next: {label} in {mins}m"
-        return "No upcoming events"
+            time_str = dt_local.strftime("%-I:%M %p")
+            # Check if this event is snoozed (match by label since we don't store event_id in _upcoming)
+            is_snoozed = label in self._snoozed_events.values()
+            snooze_tag = "  (snoozed)" if is_snoozed else ""
+            if mins == 0:
+                rows.append(f"NOW  {label}{snooze_tag}")
+            elif mins < 60:
+                rows.append(f"in {mins}m  {label}{snooze_tag}")
+            else:
+                rows.append(f"{time_str}  {label}{snooze_tag}")
+
+        for i, mi in enumerate(self._event_items):
+            if i < len(rows):
+                mi.setTitle_(rows[i])
+                mi.setHidden_(False)
+            else:
+                mi.setHidden_(True)
+
+        self._no_events_item.setHidden_(bool(rows))
 
     @objc.python_method
     def _auth_label(self) -> str:
@@ -1477,7 +1533,7 @@ class _AppDelegate(NSObject):
             self._hs_item.setHidden_(True)
 
     def refreshMenuLabels_(self, _timer):
-        self._next_item.setTitle_(self._next_event_label())
+        self._refresh_event_items()
         self._refresh_hardstop_item()
         self._auth_item.setTitle_(self._auth_label())
 
@@ -1486,6 +1542,8 @@ class _AppDelegate(NSObject):
     def _poll_loop(self) -> None:
         while True:
             try:
+                self._config = load_config()
+                self._scheduler._config = self._config
                 self._upcoming = self._scheduler.poll()
             except Exception as e:
                 print(f"Poll error: {e}")
@@ -1516,11 +1574,17 @@ class _AppDelegate(NSObject):
             event_id, label, start_dt, location, cfg, all_alerts,
             tick_target=self,
             dismiss_cb=lambda: self._on_dismiss(event_id),
+            snooze_cb=lambda eid, lbl: self._on_snooze(eid, lbl),
         )
         self._set_icon(True)
 
     @objc.python_method
+    def _on_snooze(self, event_id: str, label: str) -> None:
+        self._snoozed_events[event_id] = label
+
+    @objc.python_method
     def _on_dismiss(self, event_id: str) -> None:
+        self._snoozed_events.pop(event_id, None)
         if event_id == "__hardstop__":
             clear_hardstop()
             self._refresh_hardstop_item()
@@ -2159,7 +2223,7 @@ function buildCard(a, idx, levelNum) {
       <div class="disc-btns">
         <button class="disc-btn f-snake-btn" data-val="50">Slow</button>
         <button class="disc-btn f-snake-btn" data-val="300">Med</button>
-        <button class="disc-btn f-snake-btn" data-val="600">Fast</button>
+        <button class="disc-btn f-snake-btn" data-val="900">Fast</button>
       </div>
     </div>
   </div>
@@ -2329,7 +2393,7 @@ async function saveConfig(silent=false){
   try{
     const d=await(await fetch("/api/config",{method:"POST",headers:{"Content-Type":"application/json"},
       body:JSON.stringify({calendars:state.calendars,ics_urls:state.ics_urls,alerts:state.alerts,popup_font:state.popup_font,popup_pos:state.popup_pos,default_name:state.default_name})})).json();
-    if(!silent) d.ok?toast("✓ Saved — restart Hardstop to apply"):toast("Error: "+d.error,true);
+    if(!silent) d.ok?toast("✓ Saved"):toast("Error: "+d.error,true);
     return d.ok;
   }catch(e){if(!silent)toast("Save failed: "+e,true);return false;}
 }
